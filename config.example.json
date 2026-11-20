@@ -1,0 +1,21 @@
+{
+  "hosts": {
+    "local": {"ssh": null, "work_root": "~/amb-work"}
+  },
+  "roles": {
+    "exec.sol": {"model": "demo-sol", "cmd": "bash -c 'exec bash \"${AMB_ROOT:-$HOME/amb}/tests/fakes/exec_ok.sh\" \"$@\"' amb {workdir} {prompt_file} {out_file}"},
+    "exec.opus": {"model": "demo-opus", "cmd": "bash -c 'exec bash \"${AMB_ROOT:-$HOME/amb}/tests/fakes/exec_ok.sh\" \"$@\"' amb {workdir} {prompt_file} {out_file}"},
+    "review.opus": {"model": "demo-review", "cmd": "bash -c 'exec bash \"${AMB_ROOT:-$HOME/amb}/tests/fakes/review_pass.sh\" \"$@\"' amb {workdir} {prompt_file} {out_file}"},
+    "review.codex": {"model": "demo-review", "cmd": "bash -c 'exec bash \"${AMB_ROOT:-$HOME/amb}/tests/fakes/review_pass.sh\" \"$@\"' amb {workdir} {prompt_file} {out_file}"}
+  },
+  "ladder": {"sol": ["sol", "opus"], "opus": ["opus"]},
+  "reviewer": {"sol": "review.opus", "opus": "review.codex"},
+  "planner": "plan.fable",
+  "repos": {},
+  "defaults": {"plan_minutes": 20},
+  "webhook": {"url": "", "metadata_only": true, "client_error_backoff_s": 900},
+  "feishu": {"cmd": "", "enabled": false},
+  "linear": {"api_key_file": "", "dry_run": true},
+  "supervisor": {"enabled": false},
+  "heartbeat": ""
+}

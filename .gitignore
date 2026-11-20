@@ -1,0 +1,14 @@
+/config.json
+/jobs/
+/heartbeat
+/stats.jsonl
+/.lock
+/.tick.lock
+/.secrets/
+/build/
+/e2e/
+__pycache__/
+*.py[cod]
+*.log
+.env
+.env.*
