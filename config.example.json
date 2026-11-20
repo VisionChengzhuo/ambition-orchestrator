@@ -1,6 +1,7 @@
 {
   "hosts": {
-    "local": {"ssh": null, "work_root": "~/amb-work"}
+    "local": {"ssh": null, "work_root": "~/amb-work"},
+    "desktop": {"ssh": "example-desktop", "work_root": "~/amb-work"}
   },
   "roles": {
     "exec.sol": {"model": "demo-sol", "cmd": "bash -c 'exec bash \"${AMB_ROOT:-$HOME/amb}/tests/fakes/exec_ok.sh\" \"$@\"' amb {workdir} {prompt_file} {out_file}"},
