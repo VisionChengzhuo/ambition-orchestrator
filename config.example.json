@@ -4,19 +4,39 @@
     "desktop": {"ssh": "example-desktop", "work_root": "~/amb-work"}
   },
   "roles": {
-    "exec.sol": {"model": "demo-sol", "cmd": "bash -c 'exec bash \"${AMB_ROOT:-$HOME/amb}/tests/fakes/exec_ok.sh\" \"$@\"' amb {workdir} {prompt_file} {out_file}"},
-    "exec.opus": {"model": "demo-opus", "cmd": "bash -c 'exec bash \"${AMB_ROOT:-$HOME/amb}/tests/fakes/exec_ok.sh\" \"$@\"' amb {workdir} {prompt_file} {out_file}"},
-    "review.opus": {"model": "demo-review", "cmd": "bash -c 'exec bash \"${AMB_ROOT:-$HOME/amb}/tests/fakes/review_pass.sh\" \"$@\"' amb {workdir} {prompt_file} {out_file}"},
-    "review.codex": {"model": "demo-review", "cmd": "bash -c 'exec bash \"${AMB_ROOT:-$HOME/amb}/tests/fakes/review_pass.sh\" \"$@\"' amb {workdir} {prompt_file} {out_file}"}
+    "exec.sol": {
+      "model": "demo-sol",
+      "cmd": "bash -c 'exec bash \"${AMB_ROOT:-$HOME/amb}/tests/fakes/exec_ok.sh\" \"$@\"' amb {workdir} {prompt_file} {out_file}"
+    },
+    "exec.opus": {
+      "model": "demo-opus",
+      "cmd": "bash -c 'exec bash \"${AMB_ROOT:-$HOME/amb}/tests/fakes/exec_ok.sh\" \"$@\"' amb {workdir} {prompt_file} {out_file}"
+    },
+    "review.opus": {
+      "model": "demo-review",
+      "cmd": "bash -c 'exec bash \"${AMB_ROOT:-$HOME/amb}/tests/fakes/review_pass.sh\" \"$@\"' amb {workdir} {prompt_file} {out_file}"
+    },
+    "review.codex": {
+      "model": "demo-review",
+      "cmd": "bash -c 'exec bash \"${AMB_ROOT:-$HOME/amb}/tests/fakes/review_pass.sh\" \"$@\"' amb {workdir} {prompt_file} {out_file}"
+    },
+    "plan.opus": {
+      "model": "demo-planner",
+      "host": "local",
+      "cmd": "bash -c 'exec bash \"${AMB_ROOT:-$HOME/amb}/tests/fakes/plan_two_subs.sh\" \"$@\"' amb {workdir} {prompt_file} {out_file}"
+    }
   },
   "ladder": {"sol": ["sol", "opus"], "opus": ["opus"]},
   "reviewer": {"sol": "review.opus", "opus": "review.codex"},
-  "planner": "plan.fable",
-  "repos": {},
+  "planner": "plan.opus",
   "defaults": {"plan_minutes": 20},
+  "repos": {},
+  "runner_wake": true,
+  "sentinel": true,
+  "speed_supervisor": {"enabled": false, "host": "local", "cmd": []},
+  "supervisor": {"enabled": false},
   "webhook": {"url": "", "metadata_only": true, "client_error_backoff_s": 900},
   "feishu": {"cmd": "", "enabled": false},
   "linear": {"api_key_file": "", "dry_run": true},
-  "supervisor": {"enabled": false},
   "heartbeat": ""
 }

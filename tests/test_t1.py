@@ -237,17 +237,22 @@ class TestT1CLI(unittest.TestCase):
 
 
 class TestT1Imports(unittest.TestCase):
-    def test_amb_imports_only_from_standard_library(self):
-        tree = ast.parse(AMB.read_text(encoding="utf-8"), filename=str(AMB))
-        invalid = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                imports = [alias.name for alias in node.names]
-            elif isinstance(node, ast.ImportFrom):
-                imports = ["." * node.level + (node.module or "")]
-            else:
-                continue
-            for name in imports:
-                if name.partition(".")[0] not in sys.stdlib_module_names:
-                    invalid.append(f"line {node.lineno}: {name}")
-        self.assertEqual(invalid, [], "imports outside the Python standard library")
+    def test_amb_has_no_third_party_python_dependencies(self):
+        local_modules = {"amb", "amb_sentinel", "amb_speed"}
+        allowed = sys.stdlib_module_names | local_modules
+        for module in local_modules:
+            script = AMB.with_name(module + ".py")
+            with self.subTest(module=module):
+                tree = ast.parse(script.read_text(encoding="utf-8"), filename=str(script))
+                invalid = []
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Import):
+                        imports = [alias.name for alias in node.names]
+                    elif isinstance(node, ast.ImportFrom):
+                        imports = ["." * node.level + (node.module or "")]
+                    else:
+                        continue
+                    for name in imports:
+                        if name.partition(".")[0] not in allowed:
+                            invalid.append(f"line {node.lineno}: {name}")
+                self.assertEqual(invalid, [], "third-party imports")

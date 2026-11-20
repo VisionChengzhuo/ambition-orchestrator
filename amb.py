@@ -21,6 +21,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from graphlib import CycleError, TopologicalSorter
+
+import amb_sentinel
+import amb_speed
 
 TERMINAL = ("done", "failed", "blocked", "reopened", "cancelled")
 NOTIFY_STATES = ("waiting_host", "done", "failed", "blocked")
@@ -63,6 +67,7 @@ DEFAULT_CONFIG = {
     "heartbeat": "~/amb/heartbeat",
     "context_hooks": [],
     "supervisor": {},
+    "runner_wake": False,
 }
 
 
@@ -189,7 +194,7 @@ def att_dir(jid, st, *parts):
 
 # 在目标主机上以文件形式落地并执行的固定助手：launch/run/poll/kill。
 # 步骤参数（argv、cwd、stdin 文件）都写在 spec.json，不经过 shell。
-RUNNER = r'''
+RUNNER = amb_sentinel.PROGRESS + r'''
 import json, os, signal, subprocess, sys, time
 mode, d = sys.argv[1], sys.argv[2]
 P = lambda n: os.path.join(d, n)
@@ -201,6 +206,14 @@ def rd(n):
 def put(n, v):
     open(P(n) + ".tmp", "w").write(v)
     os.replace(P(n) + ".tmp", P(n))
+def finish(value):
+    put("exit", value)
+    if spec.get("wake"):
+        try:
+            subprocess.Popen(spec["wake"], start_new_session=True, close_fds=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
 def alive(pg):
     if not os.path.isdir("/proc/self"):
         try:
@@ -239,15 +252,28 @@ elif mode == "run":
             rc = subprocess.call(spec["argv"], cwd=spec["cwd"], stdin=stdin, stdout=out, stderr=err,
                                  timeout=spec.get("timeout"))
         except subprocess.TimeoutExpired:
-            put("exit", "timeout")
+            finish("timeout")
             os.killpg(os.getpgrp(), signal.SIGKILL)
         except OSError as exc:
             err.write(("launch error: %s\n" % exc).encode())
             rc = 127
-    put("exit", str(rc))
+    finish(str(rc))
+elif mode == "watch":
+    end = time.monotonic() + float(sys.argv[3])
+    while not os.path.isfile(P("exit")):
+        if time.monotonic() >= end:
+            sys.exit(1)
+        pid = rd("pid")
+        if pid:
+            try:
+                os.kill(int(pid.split()[0]), 0)
+            except ProcessLookupError:
+                sys.exit(0 if os.path.isfile(P("exit")) else 1)
+        time.sleep(0.25)
 elif mode == "poll":
     pid = (rd("pid") or "").split()
-    print(json.dumps({"pid": pid[:1] or None, "exit": rd("exit"), "alive": bool(pid) and alive(int(pid[-1]))}))
+    print(json.dumps({"pid": pid[:1] or None, "exit": rd("exit"), "alive": bool(pid) and alive(int(pid[-1])),
+                      "progress": output_progress(d)}))
 elif mode == "kill":
     pid = (rd("pid") or "").split()
     for f, x in ((os.killpg, pid[-1:]), (os.kill, pid[:1])):
@@ -290,7 +316,6 @@ elif mode == "stop":
                 sys.exit("runner process group is still alive")
 '''
 
-
 class Host:
     """本机或 SSH 主机上的命令执行与文件传输（argv 列表，ssh 端用 shlex.join 转义）。"""
 
@@ -300,6 +325,7 @@ class Host:
             raise StepError("host:unknown", name)
         self.name, self.ssh, self.cfg = name, hcfg.get("ssh"), hcfg
         self.timeout = cfg["defaults"]["ssh_timeout_s"]
+        self.runner_wake = cfg.get("runner_wake", False)
         self._home = None
 
     def run(self, argv, input=None, timeout=120, check=False):
@@ -346,10 +372,20 @@ class Host:
         return self.run(["python3" if self.ssh else sys.executable, f"{d}/runner.py", mode, d], check=True).stdout
 
     def launch(self, d, argv, cwd, stdin=None, timeout=None):
+        wake = tick_wake_argv() if self.runner_wake and not self.ssh else None
         self.put(f"{d}/runner.py", RUNNER)
         self.put(f"{d}/spec.json", json.dumps(
-            {"argv": argv, "cwd": cwd, "stdin": stdin, "timeout": timeout}, ensure_ascii=False))
-        return self.helper("launch", d).strip()
+            {"argv": argv, "cwd": cwd, "stdin": stdin, "timeout": timeout, "wake": wake}, ensure_ascii=False))
+        pid = self.helper("launch", d).strip()
+        if pid and self.runner_wake and self.ssh:
+            watch_seconds = timeout or 60 * 60
+            try:
+                subprocess.Popen(amb_argv("_watch-exit", self.name, d, str(watch_seconds)),
+                                 start_new_session=True, close_fds=True, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError:
+                pass
+        return pid
 
     def poll(self, d):
         return json.loads(self.helper("poll", d))
@@ -488,6 +524,8 @@ def augment_brief(job, cfg):
 
 
 def needs_review(job, st, host, repo):
+    if job.get("kind") == "doc" and job.get("plan_attempt"):
+        return False  # 父任务复核集成后的交付物及全部子任务清单。
     if (job.get("tier", "L1") in ("L2", "L3") or st.get("escalated_to_l3")
             or (job.get("kind", "code") == "code" and not job.get("accept"))):
         return True
@@ -510,7 +548,7 @@ def fail(jid, job, st, cfg, sig, detail=""):
     cur = st.get("rung", 0)
     rung = min(cur + (2 if sig == st.get("last_sig") else 1), len(ladder) - 1)
     st["last_sig"], st["run"] = sig, None
-    if sig == "plan:timeout":
+    if sig in ("plan:timeout", "dag:merge"):
         return block(st, f"{sig}：{detail}")
     if can_plan(job, st):
         nxt = "replan"
@@ -549,6 +587,35 @@ def exec_prompt(job, st, cfg, host, repo, wt):
     return "\n".join(lines) + "\n"
 
 
+def add_worktree(host, repo, base, wt, branch, ref):
+    if host.run(["test", "-e", f"{wt}/.git"]).returncode != 0:
+        host.run(["mkdir", "-p", base], check=True)
+        r = host.git(repo, "worktree", "add", "-q", "-B", branch, wt, ref, check=False)
+        if r.returncode:
+            raise StepError("setup:worktree", r.stderr.strip())
+
+
+def init_doc_repo(host, wt):
+    host.run(["mkdir", "-p", wt], check=True)
+    if host.run(["test", "-e", f"{wt}/.git"]).returncode != 0:
+        host.git(wt, "init", "-q")
+    if host.git(wt, "rev-parse", "--verify", "HEAD", check=False).returncode:
+        host.git(wt, "commit", "-q", "--allow-empty", "-m", "amb doc base")
+
+
+def merge_plan_heads(host, wt, heads):
+    shas = list(dict.fromkeys(heads.values()))
+    if len(shas) > 1:
+        shas = host.git(wt, "merge-base", "--independent", *shas).stdout.split()
+    for sha in shas:
+        r = host.git(wt, "merge", "--ff", "--no-edit", "-q", sha, check=False)
+        if r.returncode:
+            host.git(wt, "merge", "--abort", check=False)
+            sources = ", ".join(jid for jid, head in heads.items() if head == sha)
+            raise StepError("dag:merge", f"集成 {sources} 失败：{(r.stdout + r.stderr).strip()[-500:]}")
+    return host.git(wt, "rev-parse", "HEAD").stdout.strip()
+
+
 def start_attempt(jid, job, st, cfg):
     """queued → exec（或 planning）：建 worktree、写提示词、后台启动执行者。"""
     if can_plan(job, st) and (st.get("plan_needed") or not st.get("planned")):
@@ -557,23 +624,22 @@ def start_attempt(jid, job, st, cfg):
     base = workdir_base(job, st, host)
     wt, kind = f"{base}/wt", job.get("kind", "code")
     repo = host.path(job["repo"]) if job.get("repo") else None
-    if kind == "code":
+    branch = f"amb/{jid}/a{st['attempt']}"
+    if job.get("plan_attempt"):
+        parent = read_json(jobs_dir(job["parent"], "state.json"), {})
+        st["base_sha"] = parent["plan_base_sha"]
+        add_worktree(host, repo if kind == "code" else parent["wt"], base, wt, branch, st["base_sha"])
+        heads = {dep: read_json(jobs_dir(dep, "state.json"), {})["sha"] for dep in job.get("depends_on") or []}
+        st["start_sha"] = merge_plan_heads(host, wt, heads)
+    elif kind == "code":
         ref = job.get("base") or "main"
         for dep in job.get("depends_on") or []:
             ref = read_json(jobs_dir(dep, "state.json"), {}).get("sha") or ref
-        branch = f"amb/{jid}/a{st['attempt']}"
-        if host.run(["test", "-e", f"{wt}/.git"]).returncode != 0:
-            host.run(["mkdir", "-p", base], check=True)
-            r = host.git(repo, "worktree", "add", "-q", "-B", branch, wt, ref, check=False)
-            if r.returncode:
-                raise StepError("setup:worktree", r.stderr.strip())
+        add_worktree(host, repo, base, wt, branch, ref)
         st["base_sha"] = host.git(repo, "rev-parse", job.get("base") or "main").stdout.strip()
         st["start_sha"] = host.git(wt, "rev-parse", "HEAD").stdout.strip()
     elif kind == "doc":
-        host.run(["mkdir", "-p", wt], check=True)
-        if host.run(["test", "-e", f"{wt}/.git"]).returncode != 0:
-            host.git(wt, "init", "-q")
-            host.git(wt, "commit", "-q", "--allow-empty", "-m", "amb doc base")
+        init_doc_repo(host, wt)
         st["base_sha"] = st["start_sha"] = host.git(wt, "rev-parse", "HEAD").stdout.strip()
     else:
         host.run(["mkdir", "-p", wt], check=True)
@@ -635,6 +701,10 @@ def start_review(jid, job, st, cfg, host):
         directory = jobs_dir(source, "attempts", str(state.get("attempt", 1)), "exec")
         evidence += [f"### {source}", f"总结：{state.get('summary') or '—'}",
                      "未验证项：" + json.dumps(state.get("unverified") or [], ensure_ascii=False)]
+        if st.get("plan_order"):
+            child = read_json(jobs_dir(source, "job.json"), {})
+            evidence += [*[f"- 子任务复核清单：{c}" for c in child.get("checklist") or []],
+                         *[f"- 子任务验收 {a['id']}：{a['result']}" for a in state.get("accept_results") or []]]
         out = read_text(os.path.join(directory, "out"))
         if not out.strip():
             out = read_text(os.path.join(directory, "stdout"))
@@ -671,9 +741,11 @@ def start_plan(jid, job, st, cfg):
              *[f"- 禁止触碰：{item}" for item in target.cfg.get("forbidden") or []], "",
              f"KIND: {job.get('kind', 'code')}", f"REPO: {job.get('repo') or ''}", f"HOST: {job['host']}",
              f"可用执行者：{', '.join(cfg.get('ladder') or ['sol'])}", "",
-             "把任务拆成按 depends_on 串行的子任务；子任务共用父任务的 host 和 repo，后一个在前一个的结果上继续。",
+             "把任务拆成依赖图。只有确实需要另一子任务产物时才添加依赖；没有依赖的子任务同时启动。",
+             "每个子任务基于其已完成的直接依赖及其祖先的结果执行。并行任务用不同文件路径，避免集成冲突。",
              "省略 host 和 repo 以继承父任务。每个 brief 只写该子任务的行动和交付物，公共背景会自动附加。",
-             "depends_on 使用从 0 开始的下标。有现成验收命令时提供 accept，否则给 checklist。",
+             "depends_on 使用从 0 开始的下标，可引用数组中的任意其他子任务，不得成环；无依赖时写 []。",
+             "有现成验收命令时提供 accept，否则给 checklist。文档子任务清单随全部交付物在集成时复核一次。",
              '最后一条消息只输出 JSON：{"subs":[{"title":"…","brief":"…","exec":"sol",'
              '"accept":[{"id":"A1","cmd":"…"}],"checklist":[],"depends_on":[]}]}']
     if st.get("escalation_reason"):
@@ -691,6 +763,10 @@ def start_plan(jid, job, st, cfg):
     tr(st, "planning", f"{role}")
     start_step(jid, job, st, cfg, host, "plan", argv, d, limit(job, cfg, "plan_minutes") * 60,
                stdin=f"{d}/prompt.md", stepdir=d)
+
+
+def plan_order(subs):
+    return tuple(TopologicalSorter({i: sub.get("depends_on") or [] for i, sub in enumerate(subs)}).static_order())
 
 
 def check_plan(plan, job, cfg):
@@ -716,29 +792,51 @@ def check_plan(plan, job, cfg):
         deps = s.get("depends_on")
         if deps is None:
             deps = []
-        if not isinstance(deps, list) or not all(type(x) is int and 0 <= x < i for x in deps):
-            return f"子任务 {i} depends_on 只能引用前面的子任务"
+        if not isinstance(deps, list) or not all(type(x) is int and 0 <= x < len(subs) and x != i for x in deps):
+            return f"子任务 {i} depends_on 只能引用有效的其他子任务下标"
+        if len(deps) != len(set(deps)):
+            return f"子任务 {i} depends_on 有重复下标"
+    try:
+        plan_order(subs)
+    except CycleError:
+        return "子任务 depends_on 存在依赖环"
     return None
 
 
 def make_subs(jid, job, st, plan):
-    ids = []
+    ids = [f"{jid}.a{st['attempt']}s{i + 1:02d}" for i in range(len(plan["subs"]))]
     for i, s in enumerate(plan["subs"]):
-        cid = f"{jid}.a{st['attempt']}s{i + 1:02d}"
-        deps = [ids[x] for x in s.get("depends_on") or []] or ([ids[-1]] if ids else [])
-        sub = {**{k: job.get(k) for k in ("kind", "host", "repo", "base", "deadline", "protect", "limits")},
-               "id": cid, "title": s["title"], "user_words": job["user_words"], "tier": s.get("tier") or ("L2" if job.get("kind") == "doc" else "L1"),
+        cid = ids[i]
+        deps = [ids[x] for x in s.get("depends_on") or []]
+        kind = job.get("kind", "code")
+        sub = {**{k: job.get(k) for k in ("host", "repo", "base", "deadline", "protect", "limits")},
+               "id": cid, "kind": kind, "title": s["title"], "user_words": job["user_words"],
+               "tier": s.get("tier") or ("L2" if kind == "doc" else "L1"),
                "exec": s.get("exec") or job.get("exec") or "sol", "accept": s.get("accept") or [],
                "checklist": s.get("checklist") or [], "land": "none", "linear": "", "parent": jid,
-               "depends_on": deps}
+               "depends_on": deps, "plan_attempt": st["attempt"]}
         os.makedirs(jobs_dir(cid), exist_ok=True)
         write_json(jobs_dir(cid, "job.json"), sub)
         atomic_write(jobs_dir(cid, "brief.md"), f"# {s['title']}\n\n{s.get('brief') or ''}\n\n"
                      f"## 父任务 {jid}\n{read_text(jobs_dir(jid, 'brief.md'))}")
         save(cid, initial_state(sub))
-        ids.append(cid)
     st["subs"], st["planned"] = ids, True
+    st["plan_order"] = [ids[i] for i in plan_order(plan["subs"])]
+    st["plan_base_sha"] = None
     tr(st, "subs", f"{len(ids)} 个子任务")
+
+
+def prepare_plan_worktree(jid, job, st, cfg):
+    host = Host(cfg, job["host"])
+    base = workdir_base(job, st, host)
+    wt = f"{base}/wt"
+    repo = host.path(job["repo"]) if job.get("kind", "code") == "code" else None
+    if repo:
+        add_worktree(host, repo, base, wt, f"amb/{jid}/a{st['attempt']}", job.get("base") or "main")
+    else:
+        init_doc_repo(host, wt)
+    st.update(wt=wt, repo=repo, plan_base_sha=host.git(wt, "rev-parse", "HEAD").stdout.strip(),
+              unreachable_since=None)
 
 
 def check_subs(jid, job, st, cfg):
@@ -747,19 +845,25 @@ def check_subs(jid, job, st, cfg):
     if bad:
         st["needs_human"] = f"子任务 {bad[0]} {states[bad[0]]['state']}"
         return tr(st, "blocked", st["needs_human"])
+    if st.get("plan_order") and not st.get("plan_base_sha"):
+        prepare_plan_worktree(jid, job, st, cfg)
     if not all(s.get("state") == "done" for s in states.values()):
         return
-    final = states[st["subs"][-1]]
     host = Host(cfg, job["host"])
-    if job.get("kind") == "code":
+    if st.get("plan_order"):
+        deps = {d for c in states for d in read_json(jobs_dir(c, "job.json"), {}).get("depends_on") or []}
+        heads = {c: states[c]["sha"] for c in st["plan_order"] if c not in deps}
+        st.update(sha=merge_plan_heads(host, st["wt"], heads),
+                  base_sha=st["plan_base_sha"], start_sha=st["plan_base_sha"])
+    elif job.get("kind") == "code":
+        final = states[st["subs"][-1]]
         repo = host.path(job["repo"])
         wt, base = f"{workdir_base(job, st, host)}/wt", job.get("base") or "main"
-        if host.run(["test", "-e", f"{wt}/.git"]).returncode != 0:
-            host.run(["mkdir", "-p", workdir_base(job, st, host)], check=True)
-            host.git(repo, "worktree", "add", "-q", "-B", f"amb/{jid}/a{st['attempt']}", wt, final["sha"])
+        add_worktree(host, repo, workdir_base(job, st, host), wt, f"amb/{jid}/a{st['attempt']}", final["sha"])
         st.update(wt=wt, repo=repo, sha=final["sha"], base_sha=host.git(repo, "rev-parse", base).stdout.strip())
         st["start_sha"] = st["base_sha"]
     else:
+        final = states[st["subs"][-1]]
         st.update(wt=final.get("wt"), repo=None, sha=final.get("sha"), base_sha=final.get("base_sha"),
                   start_sha=final.get("base_sha"))
     st["summary"] = "；".join(s.get("summary") or "" for s in states.values() if s.get("summary"))[:500]
@@ -916,7 +1020,8 @@ def finish_step(jid, job, st, cfg, host, texts):
         if why:
             raise StepError("bad_output", why)
         write_json(att_dir(jid, st, "plan.json"), plan)
-        return make_subs(jid, job, st, plan)
+        make_subs(jid, job, st, plan)
+        return check_subs(jid, job, st, cfg)
 
 
 def poll_step(jid, job, st, cfg):
@@ -937,6 +1042,15 @@ def poll_step(jid, job, st, cfg):
         st["run"] = None
         raise StepError(f"{run['step']}:timeout", f"超过 {run['timeout']:.0f}s 被杀")
     if p["alive"]:
+        if cfg.get("sentinel") is True:
+            def legacy_progress():
+                try:
+                    argv = ["python3" if host.ssh else sys.executable, "-c", amb_sentinel.PROBE_PROGRESS, run["dir"]]
+                    return json.loads(host.run(argv, timeout=min(host.timeout, 5), check=True).stdout)
+                except (HostDown, StepError, OSError, ValueError):
+                    return None
+
+            amb_sentinel.observe_run(root(), jid, job, run, p, legacy_progress)
         return
     # 进程与 exit 都不在：基础设施重启，不加 attempt，最多 2 次。
     st["infra_restarts"] = st.get("infra_restarts", 0) + 1
@@ -962,8 +1076,32 @@ def kill_run(cfg, st):
         st["run"] = None
 
 
+def start_ready_attempt(jid, job, st, cfg):
+    deps = [read_json(jobs_dir(d, "state.json"), {}).get("state") for d in job.get("depends_on") or []]
+    if "cancelled" in deps:
+        return block(st, "依赖任务已取消")
+    for state in deps:
+        if state in TERMINAL and state != "done":
+            return block(st, f"依赖任务未完成（{state}）")
+    if not all(state == "done" for state in deps):
+        return
+    if job.get("plan_attempt"):
+        parent = read_json(jobs_dir(job["parent"], "state.json"), {})
+        if parent.get("attempt") != job["plan_attempt"] or parent.get("state") in TERMINAL:
+            return block(st, "父任务的本次规划已结束")
+        if parent.get("state") != "subs" or not parent.get("plan_base_sha"):
+            return
+    if st["state"] == "waiting_host":
+        Host(cfg, job["host"]).run(["true"])
+        st["unreachable_since"] = None
+        tr(st, "queued", "主机恢复可达")
+    start_attempt(jid, job, st, cfg)
+
+
 def tick_job(jid, cfg):
     job, st = load(jid)
+    if cfg.get("sentinel") is True:
+        amb_sentinel.observe_state(root(), jid, job, st)
     if st["state"] in TERMINAL:
         return
     before = json.dumps(st, sort_keys=True)
@@ -971,17 +1109,8 @@ def tick_job(jid, cfg):
         if parse_time(job["deadline"]) < datetime.now(timezone.utc):
             kill_run(cfg, st)
             tr(st, "failed", "超过截止时间")
-        elif st["state"] == "waiting_host":
-            Host(cfg, job["host"]).run(["true"])
-            st["unreachable_since"] = None
-            tr(st, "queued", "主机恢复可达")
-            start_attempt(jid, job, st, cfg)
-        elif st["state"] == "queued":
-            deps = [read_json(jobs_dir(d, "state.json"), {}).get("state") for d in job.get("depends_on") or []]
-            if "cancelled" in deps:
-                block(st, "依赖任务已取消")
-            elif all(s == "done" for s in deps):
-                start_attempt(jid, job, st, cfg)
+        elif st["state"] in ("waiting_host", "queued"):
+            start_ready_attempt(jid, job, st, cfg)
         elif st.get("run"):
             poll_step(jid, job, st, cfg)
         elif st["state"] == "subs":
@@ -1418,18 +1547,60 @@ def reopen_job(a, cfg):
     print(nid)
 
 
+def amb_argv(*args):
+    return ["env", "AMB_ROOT=" + root(), sys.executable, os.path.realpath(__file__), *args]
+
+
+def tick_wake_argv():
+    return amb_argv("tick", "--wake")
+
+
+def cmd_watch_exit(a, cfg):
+    host = Host(cfg, a.host)
+    try:
+        host.run(["python3", f"{a.directory}/runner.py", "watch", a.directory, str(a.seconds)],
+                 timeout=a.seconds + host.timeout + 5, check=True)
+    except (HostDown, StepError, OSError):
+        return  # cron remains the fallback for disconnected watchers
+    cmd_tick(argparse.Namespace(wake=True), cfg)
+
+
 def cmd_tick(a, cfg):
     with open(os.path.join(root(), ".tick.lock"), "a") as lock:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock, fcntl.LOCK_EX | (0 if getattr(a, "wake", False) else fcntl.LOCK_NB))
         except BlockingIOError:
             return
-        tick_all(cfg)
+        tick_all(load_config() if getattr(a, "wake", False) else cfg)
+
+
+def scheduled_jobs():
+    visited = set()
+    for jid in list_jobs():
+        if jid in visited:
+            continue
+        visited.add(jid)
+        st = read_json(jobs_dir(jid, "state.json"), {})
+        if not isinstance(st, dict):
+            yield jid
+            continue
+        integrate = st.get("state") == "subs" and st.get("plan_base_sha")
+        if not integrate:
+            yield jid
+            if st.get("state") == "planning":
+                st = read_json(jobs_dir(jid, "state.json"), {})
+        # 计划可以在本 tick 刚生成。前置先处理，已就绪的父单等到子单处理完再集成。
+        for child in st.get("plan_order") or []:
+            if child not in visited:
+                visited.add(child)
+                yield child
+        if integrate:
+            yield jid
 
 
 def tick_all(cfg):
     counts = {}
-    for jid in list_jobs():
+    for jid in scheduled_jobs():
         try:
             tick_job(jid, cfg)
             notify(jid, cfg)
@@ -1441,6 +1612,11 @@ def tick_all(cfg):
             except OSError:
                 pass
         counts[s] = counts.get(s, 0) + 1
+    try:
+        amb_speed.schedule(sys.modules[__name__], cfg)
+    except (OSError, ValueError) as exc:
+        append_jsonl(os.path.join(root(), "stats.jsonl"),
+                     {"ts": now(), "event": "speed_schedule_failed", "error": type(exc).__name__})
     try:
         forward_supervisor(cfg)
     except (HostDown, StepError, OSError) as exc:
@@ -1470,12 +1646,18 @@ def main(argv=None):
     r = sub.add_parser("reopen")
     r.add_argument("id")
     r.add_argument("--reason", required=True)
-    sub.add_parser("tick")
+    sub.add_parser("tick").add_argument("--wake", action="store_true", help=argparse.SUPPRESS)
+    watch = sub.add_parser("_watch-exit", help=argparse.SUPPRESS)
+    watch.add_argument("host")
+    watch.add_argument("directory")
+    watch.add_argument("seconds", type=float)
+    sub.add_parser("_speed-review", help=argparse.SUPPRESS)
     a = p.parse_args(argv)
     try:
         cfg = load_config()
         {"new": cmd_new, "submit": cmd_submit, "ask": cmd_ask, "status": cmd_status, "result": cmd_result,
-         "cancel": cmd_cancel, "reopen": cmd_reopen, "tick": cmd_tick}[a.cmd](a, cfg)
+         "cancel": cmd_cancel, "reopen": cmd_reopen, "tick": cmd_tick, "_watch-exit": cmd_watch_exit,
+         "_speed-review": lambda args, conf: amb_speed.review(sys.modules[__name__], conf)}[a.cmd](a, cfg)
     except AmbError as exc:
         print(f"amb: {exc}", file=sys.stderr)
         return exc.code

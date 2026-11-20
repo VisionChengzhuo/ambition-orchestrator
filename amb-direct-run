@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""Launch direct tasks in isolated directories and relay follow-up instructions."""
+import argparse
+import fcntl
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+
+POLL_SECONDS = 5
+NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}\Z")
+CODEX_OPTIONS = ["--json", "--skip-git-repo-check", "-o", "out.md"]
+INBOX_INSTRUCTIONS = """追加指令会写入本任务目录的 inbox（每行一个 JSON 对象，含 message 字段，序号从 1 开始）。
+执行中可在自然检查点和提交最终答复前读取 inbox，处理尚未确认的消息。
+处理完连续的消息后，把最后一条已处理的序号写入 inbox.ack（例如先写 .inbox.ack.tmp，再用 mv 原子替换）。
+收到接续提示时，按提示继续本会话。若某条已处理，请略过。"""
+
+
+def stamp():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def atomic_write(path, value):
+    temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp.write_text(value, encoding="utf-8")
+        temp.replace(path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+@contextmanager
+def inbox_lock(directory):
+    with (directory / ".inbox.lock").open("a") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        yield
+
+
+def update_status(directory, status, phase, **details):
+    status.update(phase=phase, updated_at=stamp(), **details)
+    atomic_write(directory / "status.json", json.dumps(status, ensure_ascii=False) + "\n")
+
+
+def finish(directory, status, code, **details):
+    update_status(directory, status, "done" if code == 0 else "failed", exit_code=code, **details)
+    atomic_write(directory / "exit", f"{code}\n")
+
+
+def exit_code(path):
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    return int(value) if value else None
+
+
+def pending_messages(directory, consumed):
+    with (directory / "inbox").open(encoding="utf-8") as stream:
+        messages = list(stream)
+    try:
+        acknowledged = exit_code(directory / "inbox.ack")
+    except ValueError:
+        acknowledged = None
+    if acknowledged is not None and consumed < acknowledged <= len(messages):
+        consumed = acknowledged
+    return "\n".join(f"{number}. {json.loads(entry)['message']}"
+                     for number, entry in enumerate(messages[consumed:], consumed + 1)), len(messages)
+
+
+def agent_turn(args, directory, prompt, session, first):
+    if args.agent == "claude":
+        argv = ["claude", "-p", "--session-id" if first else "--resume", session,
+                "--permission-prompts", "none", "--permission-mode", "bypassPermissions"]
+        if args.effort:
+            argv.extend(["--effort", args.effort])
+        output = directory / "out.md"
+    else:
+        argv = ["codex", "exec"] if first else ["codex", "exec", "resume"]
+        argv.extend(CODEX_OPTIONS + ["--dangerously-bypass-approvals-and-sandbox"])
+        if args.effort:
+            argv.extend(["-c", f"model_reasoning_effort={json.dumps(args.effort)}"])
+        output = directory / "log.txt"
+    if args.model:
+        argv.extend(["--model", args.model])
+    if args.agent == "codex":
+        if not first:
+            argv.append(session)
+        argv.append("-")
+    with output.open("a", encoding="utf-8") as stdout, (directory / "err.log").open("a") as stderr:
+        start = stdout.tell()
+        process = subprocess.run(argv, cwd=directory, input=prompt, text=True, encoding="utf-8",
+                                 stdout=stdout, stderr=stderr, check=False)
+    code = process.returncode
+    if args.agent == "codex" and first and code == 0:
+        with output.open("rb") as stream:
+            stream.seek(start)
+            for line in stream:
+                try:
+                    event = json.loads(line)
+                except (ValueError, UnicodeError):
+                    continue
+                if isinstance(event, dict) and event.get("type") == "thread.started":
+                    session = str(uuid.UUID(event["thread_id"]))
+                    break
+        if not session:
+            raise ValueError("Codex 未报告本次运行的会话 ID")
+    return code if code >= 0 else 128 - code, session
+
+
+def run_task(args, base):
+    brief = (sys.stdin.read() if args.prompt == "-" else
+             Path(args.prompt).expanduser().read_text(encoding="utf-8"))
+    if not brief.strip():
+        raise ValueError("任务指令不能为空")
+    if args.name in args.after:
+        raise ValueError("任务不能依赖自身")
+    base.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory = base / args.name
+    directory.mkdir(mode=0o700)
+    status = {
+        "schema_version": 1, "name": args.name, "agent": args.agent,
+        "pid": os.getpid(), "created_at": stamp(), "dependencies": args.after,
+    }
+    consumed = 0
+    turn = 0
+    session = str(uuid.uuid4()) if args.agent == "claude" else None
+    try:
+        atomic_write(directory / "prompt.md", brief)
+        (directory / "inbox").touch()
+        (directory / "log.txt").touch()
+        update_status(directory, status, "waiting", turn=turn)
+        print(directory, flush=True)
+        waiting = [base / name / "exit" for name in args.after]
+        while waiting:
+            remaining = []
+            for prerequisite in waiting:
+                code = exit_code(prerequisite)
+                if code is None:
+                    remaining.append(prerequisite)
+                elif code != 0:
+                    raise ValueError(f"前置任务 {prerequisite.parent.name} 的退出码为 {code}")
+            waiting = remaining
+            if waiting:
+                time.sleep(POLL_SECONDS)
+        predecessor_dirs = "\n".join(str(base / name) for name in args.after)
+        prompt = brief + "\n\n" + INBOX_INSTRUCTIONS
+        if predecessor_dirs:
+            prompt += "\n\n前置任务已成功完成，产物在以下目录：\n" + predecessor_dirs
+
+        while True:
+            with inbox_lock(directory):
+                messages, delivered = pending_messages(directory, consumed)
+                if turn and not messages:
+                    finish(directory, status, 0)
+                    return 0
+                if messages:
+                    if turn:
+                        prompt = "继续处理本任务。以下是尚未确认的追加指令："
+                    prompt += f"\n\n追加指令（序号与 inbox 行号一致）：\n{messages}"
+                turn += 1
+                update_status(directory, status, "running", turn=turn, session_id=session)
+            code, session = agent_turn(args, directory, prompt, session, first=(turn == 1))
+            status["session_id"] = session
+            if code:
+                with inbox_lock(directory):
+                    finish(directory, status, code)
+                return code
+            consumed = delivered
+    except (OSError, ValueError, KeyError, TypeError, KeyboardInterrupt, SystemExit) as exc:
+        code = exc.code if isinstance(exc, SystemExit) else 130 if isinstance(exc, KeyboardInterrupt) else 1
+        with inbox_lock(directory):
+            finish(directory, status, code, error=str(exc) or "interrupted")
+        if code == 1:
+            print(f"amb-direct-run: {exc}", file=sys.stderr)
+        return code
+
+
+def send(args, base):
+    if not args.message.strip():
+        raise ValueError("追加指令不能为空")
+    directory = base / args.name
+    if not (directory / "status.json").is_file():
+        raise ValueError(f"找不到任务 {args.name} 的运行记录")
+    with inbox_lock(directory):
+        status = json.loads((directory / "status.json").read_text(encoding="utf-8"))
+        if status.get("schema_version") != 1 or status.get("phase") not in {"waiting", "running"}:
+            raise ValueError(f"任务 {args.name} 已结束或不接受追加指令")
+        message = json.dumps({"at": stamp(), "message": args.message}, ensure_ascii=False)
+        with (directory / "inbox").open("a", encoding="utf-8") as stream:
+            stream.write(message + "\n")
+    return 0
+
+
+def task_name(value):
+    if not NAME.fullmatch(value):
+        raise argparse.ArgumentTypeError("任务名须以字母或数字起始，只允许字母、数字、点、下划线和连字符")
+    return value
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    run = subparsers.add_parser("run", help="在新目录和新会话中执行任务")
+    run.add_argument("name", type=task_name)
+    run.add_argument("--prompt", required=True, help="任务指令文件，- 表示标准输入")
+    run.add_argument("--after", action="append", default=[], type=task_name, help="前置任务名，可重复")
+    run.add_argument("--agent", choices=["codex", "claude"], default="codex")
+    run.add_argument("--model")
+    run.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
+    message = subparsers.add_parser("send", help="向等待中或执行中的任务追加指令")
+    message.add_argument("name", type=task_name)
+    message.add_argument("message")
+    args = parser.parse_args()
+    base = Path(os.environ.get("AMB_DIRECT_ROOT", "~/amb-direct")).expanduser().resolve()
+    try:
+        if args.command == "send":
+            return send(args, base)
+        signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
+        return run_task(args, base)
+    except (OSError, ValueError) as exc:
+        print(f"amb-direct-run: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
