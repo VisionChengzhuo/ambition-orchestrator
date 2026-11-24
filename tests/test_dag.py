@@ -15,7 +15,7 @@ class TestDAG(T5Base):
     def plan(self, *nodes):
         subs = [{"title": title, "depends_on": deps, "checklist": [f"check {title}"]} for title, deps in nodes]
         script = self.script("plan_graph.sh", "cat > \"$3\" <<'PLAN'\n" + json.dumps({"subs": subs}) + "\nPLAN\n")
-        self.set_role("plan.fable", script)
+        self.set_role("plan.opus", script)
 
     def test_plan_validation(self):
         job = {"host": "local", "repo": str(self.repo)}
@@ -53,8 +53,20 @@ case "$title" in
         ;;
     join)
         test -f left && test -f right && test ! -f separate || exit 8
+        if test "{kind}" = doc; then
+            for report in RESULT.md out.md; do
+                grep -qx 'left report' "$report" && grep -qx 'right report' "$report" || exit 7
+            done
+            python3 -c 'import json, sys; sys.exit(json.load(open("deliver.json"))["files"] != ["common", "left", "right"])' || exit 6
+        fi
         ;;
 esac
+if test "{kind}" = doc && test "$title" != join; then
+    for report in RESULT.md out.md; do
+        printf '%s report\n' "$title" > "$report"
+    done
+    printf '{{"files":["common","%s"]}}\n' "$title" > deliver.json
+fi
 printf '%s\n' "$title" > "$title"
 printf '%s\n' '{{"summary":"created artifact"}}' > "$3"
 """)
@@ -87,6 +99,74 @@ printf '%s\n' '{{"summary":"created artifact"}}' > "$3"
         final, children = self.run_parallel_graph("doc")
         self.assertEqual(final["review"]["verdict"], "PASS")
         self.assertTrue(all(not self.history_to(child, "review") for child in children))
+        for report in ("RESULT.md", "out.md"):
+            lines = (Path(final["wt"]) / report).read_text().splitlines()
+            self.assertCountEqual([line for line in lines if line.endswith(" report")],
+                                  ["left report", "right report", "separate report"])
+        manifest = json.loads((Path(final["wt"]) / "deliver.json").read_text())
+        self.assertCountEqual(manifest["files"], ["common", "left", "right", "separate"])
+
+    def test_doc_delivery_manifest_preserves_metadata(self):
+        manifest = self.repo / "delivery-manifest.json"
+        base = self.git("rev-parse", "HEAD").strip()
+        heads = {}
+        for branch in ("left", "right"):
+            self.git("switch", "-qc", branch, base)
+            manifest.write_text(json.dumps({"files": ["shared/*", branch], branch: {"ready": True}}))
+            self.git("add", manifest.name)
+            self.git("commit", "-qm", branch)
+            heads[branch] = self.git("rev-parse", "HEAD").strip()
+        self.git("switch", "-q", "--detach", base)
+        amb.merge_plan_heads(amb.Host(self.config, "local"), str(self.repo), heads, doc=True)
+        self.assertEqual(json.loads(manifest.read_text()),
+                         {"files": ["shared/*", "left", "right"],
+                          "left": {"ready": True}, "right": {"ready": True}})
+
+    def test_doc_lowercase_result_add_add_keeps_both_versions(self):
+        base = self.git("rev-parse", "HEAD").strip()
+        heads = {}
+        for branch in ("left", "right"):
+            self.git("switch", "-qc", branch, base)
+            for name in ("result.md", "reply.md"):
+                (self.repo / name).write_text(f"{branch} {name}\n")
+            self.git("add", "result.md", "reply.md")
+            self.git("commit", "-qm", branch)
+            heads[branch] = self.git("rev-parse", "HEAD").strip()
+        self.git("switch", "-q", "--detach", base)
+        amb.merge_plan_heads(amb.Host(self.config, "local"), str(self.repo), heads, doc=True)
+        for name in ("result.md", "reply.md"):
+            self.assertEqual((self.repo / name).read_text(), f"left {name}\n\n\n---\n\nright {name}\n")
+
+    def test_doc_report_edits_keep_both_versions_and_business_conflicts_block(self):
+        report = self.repo / "RESULT.md"
+        business = self.repo / "business.md"
+        report.write_text("common report\n")
+        business.write_text("common content\n")
+        self.git("add", "RESULT.md", "business.md")
+        self.git("commit", "-qm", "common")
+        base = self.git("rev-parse", "HEAD").strip()
+        heads = {}
+        for branch in ("left", "right"):
+            self.git("switch", "-qc", branch, base)
+            report.write_text(f"{branch} report\n")
+            self.git("commit", "-qam", branch)
+            heads[branch] = self.git("rev-parse", "HEAD").strip()
+        host = amb.Host(self.config, "local")
+        self.git("switch", "-q", "--detach", base)
+        amb.merge_plan_heads(host, str(self.repo), heads, doc=True)
+        self.assertEqual(report.read_text(), "left report\n\n\n---\n\nright report\n")
+        for branch in heads:
+            self.git("switch", "-q", branch)
+            business.write_text(f"{branch} content\n")
+            self.git("commit", "-qam", "update business")
+            heads[branch] = self.git("rev-parse", "HEAD").strip()
+        self.git("switch", "-q", "--detach", base)
+        with self.assertRaises(amb.StepError) as raised:
+            amb.merge_plan_heads(host, str(self.repo), heads, doc=True)
+        self.assertEqual(raised.exception.sig, "dag:merge")
+        self.assertIn("business.md", raised.exception.detail)
+        self.assertEqual(self.git("rev-parse", "HEAD").strip(), heads["left"])
+        self.assertEqual(self.git("status", "--porcelain"), "")
 
     def test_conflicting_independent_outputs_block_integration(self):
         self.plan(("left", []), ("right", []))

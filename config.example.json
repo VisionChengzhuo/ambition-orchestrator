@@ -1,7 +1,13 @@
 {
   "hosts": {
-    "local": {"ssh": null, "work_root": "~/amb-work"},
-    "desktop": {"ssh": "example-desktop", "work_root": "~/amb-work"}
+    "local": {
+      "ssh": null,
+      "work_root": "~/amb-work"
+    },
+    "desktop": {
+      "ssh": "example-desktop",
+      "work_root": "~/amb-work"
+    }
   },
   "roles": {
     "exec.sol": {
@@ -24,19 +30,51 @@
       "model": "demo-planner",
       "host": "local",
       "cmd": "bash -c 'exec bash \"${AMB_ROOT:-$HOME/amb}/tests/fakes/plan_two_subs.sh\" \"$@\"' amb {workdir} {prompt_file} {out_file}"
+    },
+    "exec.opus-high": {
+      "model": "demo-opus-high",
+      "cmd": "bash -c 'exec bash \"${AMB_ROOT:-$HOME/amb}/tests/fakes/exec_ok.sh\" \"$@\"' amb {workdir} {prompt_file} {out_file}"
     }
   },
-  "ladder": {"sol": ["sol", "opus"], "opus": ["opus"]},
-  "reviewer": {"sol": "review.opus", "opus": "review.codex"},
+  "ladder": {
+    "sol": [
+      "sol",
+      "opus",
+      "replan"
+    ],
+    "opus": [
+      "opus",
+      "opus-high",
+      "replan"
+    ]
+  },
+  "reviewer": {
+    "sol": "review.opus",
+    "opus": "review.codex",
+    "opus-high": "review.codex"
+  },
   "planner": "plan.opus",
-  "defaults": {"plan_minutes": 20},
+  "defaults": {
+    "plan_minutes": 20,
+    "max_attempts": 3
+  },
   "repos": {},
   "runner_wake": true,
   "sentinel": true,
-  "speed_supervisor": {"enabled": false, "host": "local", "cmd": []},
-  "supervisor": {"enabled": false},
-  "webhook": {"url": "", "metadata_only": true, "client_error_backoff_s": 900},
-  "feishu": {"cmd": "", "enabled": false},
-  "linear": {"api_key_file": "", "dry_run": true},
+  "speed_supervisor": false,
+  "supervisor": {},
+  "webhook": {
+    "url": "",
+    "metadata_only": true,
+    "client_error_backoff_s": 900
+  },
+  "feishu": {
+    "cmd": "",
+    "enabled": false
+  },
+  "linear": {
+    "api_key_file": "",
+    "dry_run": true
+  },
   "heartbeat": ""
 }

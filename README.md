@@ -17,7 +17,7 @@ Ambition 是一个由 Python 标准库实现的任务编排器。它接收代码
 cd ~/amb
 cp -n config.example.json config.json
 python3 amb.py --help
-id=$(python3 amb.py new --kind doc --tier L1 --host local --exec sol)
+id=$(python3 amb.py new --kind doc --tier L1 --host local --exec sol --once --goal '验证本机执行链路，任务完成后生成 DONE.txt。')
 ```
 
 在 `jobs/_draft/<id>/job.json` 填写 `title` 和 `user_words`，再在同目录编辑 `brief.md`。提交后手动运行一次 `tick` 启动任务，后续步骤完成时会唤醒调度器。也可手动再运行 `tick` 收集已完成的结果。
@@ -30,7 +30,7 @@ python3 amb.py status "$id"
 python3 amb.py result "$id"
 ```
 
-示例使用随仓库提供的本地测试执行者、规划器和复核者，执行成功后会生成 `DONE.txt`。也可用 `--tier L3` 试跑文档依赖链。实际任务请配置模型命令。需要每分钟自动推进时，运行 `bash install-cron.sh`。该脚本使用默认的 `~/amb` 布局。单独部署时可通过 `AMB_ROOT` 指定配置和任务状态目录。
+示例使用随仓库提供的本地测试执行者、规划器和复核者，执行成功后会生成 `DONE.txt`。也可用 `--tier L3` 试跑文档依赖链。实际任务请配置模型命令。若使用 Claude 包装器，可在 `hosts.<host>.claude_launcher` 设置其启动命令。需要每分钟自动推进时，运行 `bash install-cron.sh`。该脚本使用默认的 `~/amb` 布局。单独部署时可通过 `AMB_ROOT` 指定配置和任务状态目录。
 
 ## 配置
 
@@ -44,7 +44,7 @@ python3 amb.py result "$id"
 | `repos` | 以 `<host>:<repo>` 为键设置仓库权限。验收命令以执行账号运行，应来自可信任务。模型角色也使用目标主机上的执行账号权限。 |
 | `webhook`、`feishu`、`linear`、`supervisor` | 按部署需要启用。Webhook 凭据可通过权限受限的 `config_file` 读取。Linear 默认 dry-run，启用真实写入时使用 `api_key_file`。 |
 | `runner_wake`、`sentinel` | 分别启用步骤退出唤醒和按规则巡检。 |
-| `speed_supervisor` | 默认关闭。启用时设置 `enabled: true`、已配置的 `host` 和命令参数数组 `cmd`。 |
+| `speed_supervisor` | 默认关闭。启用时设置 `true`，并配置 `kml-dev` 主机和该主机上的 `/opt/amb/claude-full`。 |
 
 执行者的最后一条消息应包含 `{"summary":"结果摘要","unverified":[]}`。复核者输出 `{"verdict":"PASS","sha":"<候选提交 SHA>","findings":[]}`。步骤提示词会提供对应的完整协议。
 
@@ -68,10 +68,16 @@ python3 amb.py result "$id"
 
 任务目录默认为 `~/amb-direct/<任务名>`，可通过 `AMB_DIRECT_ROOT` 设置根目录。`send` 将指令写入 `inbox`，执行者可在执行过程中读取。当轮结束后，未确认的指令进入同一会话的下一轮。结果见 `out.md`，状态见 `status.json`，Codex 事件见 `log.txt`，错误输出见 `err.log`，最终退出码见 `exit`。
 
-## 派活 Skill
+## Skills
 
 [ambition-dispatch](skill/ambition-dispatch/SKILL.md) 定义如何按难度选择执行者、填写任务、读取进度和回报证据。将该目录放入所用代理的 skill 搜索路径，并确认代理能够调用 `amb.py`。其通知处理约定也可用于已配置的 webhook 接收端。
 
+[autoresearch](skill/autoresearch/SKILL.md) 定义怎样组织跨多轮推进的研究课题。安装方式相同。用到的 `ar` 运行时需由部署者另外配置。
+
+Linear 应用集成可通过 `linear.app_cmd` 接入，飞书结果投递可配置 `AMB_JOB_DELIVER_HELPER`。部署时可将 GPU 规则文件路径设置在 `AMB_H200_RULES`，由编排器按任务内容引用。
+
+使用 pytest 运行框架测试。
+
 ```bash
-python3 -m unittest discover -s tests -v
+python3 -m pytest -q
 ```

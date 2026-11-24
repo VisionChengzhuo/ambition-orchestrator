@@ -12,7 +12,7 @@ from pathlib import Path
 
 AMB = Path(__file__).resolve().parents[1] / "amb.py"
 FAKES = Path(__file__).resolve().parent / "fakes"
-JOB_ID = "J-0101-01"
+JOB_ID = "J-1120-01"
 
 
 def write_json(path, data):
@@ -118,7 +118,7 @@ class TestT1CLI(unittest.TestCase):
 
     def test_new_prints_id_and_creates_draft(self):
         result = self.amb(
-            "new", "--kind", "code", "--tier", "L1", "--host", "local",
+            "new", "--once", "--kind", "code", "--tier", "L1", "--host", "local",
             "--repo", str(self.repo),
         )
         job_id = result.stdout.strip()
@@ -150,10 +150,13 @@ class TestT1CLI(unittest.TestCase):
         self.assert_submit_rejected(accept=[], land="merge")
 
     def test_new_accepts_explicit_executor(self):
-        jid = self.amb("new", "--kind", "doc", "--tier", "L1", "--exec", "opus").stdout.strip()
+        jid = self.amb("new", "--once", "--kind", "doc", "--tier", "L1", "--exec", "opus").stdout.strip()
         job = json.loads((self.jobs / "_draft" / jid / "job.json").read_text())
         self.assertEqual(job["exec"], "opus")
-        self.amb("new", "--exec", "fable", expected=2)
+        # autoresearch_design A1：AutoResearch 总指挥要能显式派 Fable 单（默认仍不是 Fable）
+        jid = self.amb("new", "--once", "--kind", "doc", "--exec", "fable").stdout.strip()
+        self.assertEqual(json.loads((self.jobs / "_draft" / jid / "job.json").read_text())["exec"], "fable")
+        self.amb("new", "--exec", "astra", expected=2)
 
     def test_submit_rejects_code_without_repo(self):
         self.assert_submit_rejected(repo="")
@@ -192,7 +195,6 @@ class TestT1CLI(unittest.TestCase):
         self.assertTrue((job / "job.json").is_file())
         self.assertEqual((job / "brief.md").read_bytes(), brief)
         state = json.loads((job / "state.json").read_text(encoding="utf-8"))
-        self.assertEqual(state["state"], "queued")
         queued = [entry for entry in state["history"] if entry["to"] == "queued"]
         self.assertEqual(len(queued), 1)
         self.assertTrue({"ts", "from", "to", "why"} <= queued[0].keys())
@@ -211,7 +213,7 @@ class TestT1CLI(unittest.TestCase):
         return job
 
     def test_status_lists_tasks_and_filters_by_id(self):
-        other_id = "J-0101-02"
+        other_id = "J-1120-02"
         self.stored_job(JOB_ID)
         self.stored_job(other_id)
 
@@ -228,7 +230,7 @@ class TestT1CLI(unittest.TestCase):
 
     def test_result_prints_stored_markdown(self):
         job = self.stored_job(JOB_ID)
-        markdown = "# J-0101-01\n结论：本地验收通过。\n"
+        markdown = "# J-1120-01\n结论：本地验收通过。\n"
         (job / "result.md").write_text(markdown, encoding="utf-8")
         self.assertEqual(self.amb("result", JOB_ID).stdout.rstrip("\n"), markdown.rstrip("\n"))
 
@@ -238,7 +240,10 @@ class TestT1CLI(unittest.TestCase):
 
 class TestT1Imports(unittest.TestCase):
     def test_amb_has_no_third_party_python_dependencies(self):
-        local_modules = {"amb", "amb_sentinel", "amb_speed"}
+        local_modules = {
+            "amb", "amb_events", "amb_metrics", "amb_router", "amb_sentinel", "amb_speed",
+            "ambition_job_deliver", "card_text",
+        }
         allowed = sys.stdlib_module_names | local_modules
         for module in local_modules:
             script = AMB.with_name(module + ".py")

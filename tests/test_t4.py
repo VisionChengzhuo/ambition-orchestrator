@@ -1,9 +1,10 @@
 """T4 黑盒测试：结果文件与通知、心跳、ask、reopen、stats。"""
 import json
-import secrets
+import time
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
+import amb_events
 
 try:
     from test_t2 import FAKES, JOB_ID, TERMINAL, T2Base
@@ -45,6 +46,12 @@ class T4Base(T2Base):
         self.addCleanup(rec.close)
         return rec
 
+    def wait_requests(self, recorder, count):
+        deadline = time.monotonic() + 5
+        while len(recorder.requests) < count and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(len(recorder.requests), count)
+
 
 class TestT4Results(T4Base):
     def test_result_files(self):
@@ -64,7 +71,17 @@ class TestT4Results(T4Base):
         self.done_job()
         self.assertTrue((self.root / "heartbeat").is_file())
         stats = [json.loads(l) for l in (self.root / "stats.jsonl").read_text(encoding="utf-8").splitlines()]
-        self.assertEqual([s["event"] for s in stats if s["id"] == JOB_ID], ["done"])
+        self.assertEqual([s["event"] for s in stats if s["id"] == JOB_ID],
+                         ["timing_dispatched", "timing_started", "done"])
+        done = stats[-1]
+        for key in ("asked_at", "dispatched_at", "started_at", "finished_at"):
+            self.assertIsNotNone(done[key], key)
+        self.assertIsNone(done["delivered_at"])
+        first = self.amb("delivered", JOB_ID).stdout.strip()
+        self.assertEqual(self.amb("delivered", JOB_ID).stdout.strip(), first)
+        speed = json.loads(self.amb("speed", "--json").stdout)
+        self.assertEqual(speed["samples"]["delivery"], 1)
+        self.assertIsNotNone(speed["post_completion_median_minutes"])
 
     def test_ask_has_fixed_unverified(self):
         jid = self.amb("ask", "--host", "local", "磁盘还剩多少？$(touch pwned)").stdout.strip()
@@ -78,7 +95,7 @@ class TestT4Results(T4Base):
         nid = self.amb("reopen", JOB_ID, "--reason", "结果不对：少了一行").stdout.strip()
         self.assertEqual(nid, f"{JOB_ID}r1")
         self.assertEqual(self.state()["state"], "reopened")
-        self.assertEqual(self.state(nid)["state"], "queued")
+        self.assertEqual(self.state(nid)["history"][0]["to"], "queued")
         brief = (self.jobs / nid / "brief.md").read_text(encoding="utf-8")
         self.assertIn("结果不对：少了一行", brief)
         self.assertIn(JOB_ID, brief)
@@ -93,27 +110,40 @@ class TestT4Webhook(T4Base):
         self.done_job()
         self.assertIs(self.state()["notified"]["webhook"], False)
         rec = self.hook()
-        fixture_value = secrets.token_hex(16)
-        self.config["webhook"] = {"url": rec.url, "secret": fixture_value, "header": "X-Amb-Token"}
+        self.config["webhook"] = {"url": rec.url, "secret": "s3cret", "header": "X-Amb-Token"}
         self.save_config()
         self.tick()
         self.tick()
-        self.assertEqual(len(rec.requests), 1)
+        self.wait_requests(rec, 1)
         headers, body = rec.requests[0]
-        self.assertEqual(headers.get("X-Amb-Token"), fixture_value)
+        self.assertEqual(headers.get("X-Amb-Token"), "s3cret")
         self.assertEqual(body["id"], JOB_ID)
         self.assertEqual(body["state"], "done")
-        self.assertEqual(self.state()["notified"]["webhook"], "done")
+        sent = amb_events.event_dir(self.root) / "sent"
+        # 收件端先记下请求再回 200，发送端拿到响应后才写 sent；满载时两者有先后，等落盘再数
+        deadline = time.monotonic() + 5
+        while not list(sent.glob("*.json")) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(len(list(sent.glob("*.json"))), 1)
 
     def test_non_2xx_is_retried(self):
         rec = self.hook(codes=[500])
         self.config["webhook"] = {"url": rec.url, "secret": "", "header": ""}
         self.save_config()
         self.done_job()
-        self.tick()
-        self.tick()
-        self.assertEqual(len(rec.requests), 2, rec.requests)
-        self.assertEqual(self.state()["notified"]["webhook"], "done")
+        self.wait_requests(rec, 1)
+        event_dir = amb_events.event_dir(self.root)
+        pending, = event_dir.glob("*.json")
+        deadline = time.monotonic() + 5
+        while not json.loads(pending.read_text()).get("retry_at") and time.monotonic() < deadline:
+            time.sleep(0.02)
+        retry = json.loads(pending.read_text())
+        self.assertEqual(retry["http_status"], 500)
+        retry["retry_at"] = 0
+        pending.write_text(json.dumps(retry))
+        self.amb("_job-events")
+        self.wait_requests(rec, 2)
+        self.assertFalse(pending.exists())
 
 
 class TestT4Feishu(T4Base):
@@ -141,7 +171,7 @@ class TestT4Feishu(T4Base):
 
 class TestT4Linear(T4Base):
     def test_dry_run_block_has_five_lines_and_missing_fields(self):
-        self.done_job(linear="DEMO-999")
+        self.done_job(linear="TCZ-123")
         text = (self.jobs / JOB_ID / "linear_block.md").read_text(encoding="utf-8")
         head, body = text.split("\n", 1)
         self.assertIn("linear.api_key_file", head)
@@ -151,47 +181,15 @@ class TestT4Linear(T4Base):
         self.assertEqual(len(inner), 5, inner)
         self.assertIn("done", inner[0])
 
-    def test_real_mode_overwrites_block_between_markers(self):
-        calls = []
-
-        class H(BaseHTTPRequestHandler):
-            def do_POST(self):
-                req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                calls.append((self.headers.get("Authorization"), req))
-                if req["query"].startswith("query"):
-                    data = {"issue": {"id": "uuid-1", "description":
-                            "背景\n<!-- amb:status -->\nold\n<!-- /amb:status -->\n尾部"}}
-                else:
-                    data = {"issueUpdate": {"success": True}}
-                out = json.dumps({"data": data}).encode()
-                self.send_response(200)
-                self.send_header("Content-Length", str(len(out)))
-                self.end_headers()
-                self.wfile.write(out)
-
-            def log_message(self, *a):
-                pass
-
-        srv = HTTPServer(("127.0.0.1", 0), H)
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
-        self.addCleanup(srv.server_close)
-        self.addCleanup(srv.shutdown)
+    def test_legacy_key_config_does_not_write_to_linear_directly(self):
+        recorder = self.hook()
         key = self.root / "linear.key"
-        fixture_value = secrets.token_hex(16)
-        key.write_text(f"{fixture_value}\n", encoding="utf-8")
+        key.write_text("lin_test_key\n", encoding="utf-8")
         self.config["linear"] = {"api_key_file": str(key), "dry_run": False,
-                                 "endpoint": f"http://127.0.0.1:{srv.server_port}/graphql"}
+                                 "endpoint": recorder.url}
         self.save_config()
-        self.done_job(linear="DEMO-999")
-        updates = [r for _, r in calls if r["query"].startswith("mutation")]
-        self.assertTrue(updates)
-        desc = updates[-1]["variables"]["d"]
-        self.assertTrue(desc.startswith("背景\n<!-- amb:status -->"), desc)
-        self.assertTrue(desc.endswith("<!-- /amb:status -->\n尾部"), desc)
-        self.assertNotIn("old", desc)
-        self.assertIn("done", desc)
-        self.assertEqual(calls[0][0], fixture_value)
-        self.assertFalse(any("comment" in r["query"].lower() for _, r in calls))
+        self.done_job(linear="TCZ-123")
+        self.assertEqual(recorder.requests, [])
         self.assertFalse((self.jobs / JOB_ID / "linear_block.md").exists())
 
 

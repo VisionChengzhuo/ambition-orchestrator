@@ -23,7 +23,7 @@ from pathlib import Path
 
 AMB = Path(__file__).resolve().parents[1] / "amb.py"
 FAKES = Path(__file__).resolve().parent / "fakes"
-JOB_ID = "J-0101-01"
+JOB_ID = "J-1120-01"
 TERMINAL = {"done", "failed", "blocked"}
 
 
@@ -161,7 +161,9 @@ class T2Base(unittest.TestCase):
     def tick(self, expected=0):
         return self.amb("tick", expected=expected)
 
-    def submit(self, job_id=JOB_ID, brief="# T2 fixture\n", **overrides):
+    def submit(self, job_id=JOB_ID,
+               brief="# T2 fixture\n\nAppend DONE.txt in the repository and verify the result with the configured checks.\n",
+               **overrides):
         job = {
             "id": job_id,
             "kind": "code",
@@ -258,6 +260,53 @@ class T2Base(unittest.TestCase):
 
 
 class TestT2Lifecycle(T2Base):
+    def test_new_astra_uses_astra_role_and_configured_reviewer(self):
+        self.set_role("exec.astra", FAKES / "exec_ok.sh")
+        self.config["ladder"]["astra"] = ["astra", "sol", "replan"]
+        self.config["reviewer"]["astra"] = "review.opus"
+        self.save_config()
+        jid = self.amb("new", "--once", "--tier", "L2", "--repo", str(self.repo),
+                       "--exec", "astra").stdout.strip()
+        draft = self.jobs / "_draft" / jid / "job.json"
+        job = json.loads(draft.read_text())
+        self.assertEqual(job["exec"], "astra")
+        job.update(title="Astra routing fixture", user_words="验证 Astra 执行和复核路由。")
+        write_json(draft, job)
+        self.amb("submit", jid)
+        state = self.tick_until(lambda st: st["state"] in TERMINAL, job_id=jid)
+        self.assertEqual(state["state"], "done")
+        self.assertEqual(state["attempts"]["1"]["exec"], "exec.astra")
+        self.assertEqual(state["attempts"]["1"]["review"], "review.opus")
+
+    def test_speed_hint_is_fixed_at_dispatch_and_matches_the_ledger(self):
+        expected_hint = """## 速度
+- 目标是最快把可验证的结果交到用户手上。
+- 互不依赖、各自要等的步骤（远程命令、下载、测试、多机检查）放到后台同时跑，不串行等待。
+- 只有在至少两块工作互不依赖、各需数分钟以上、且不改同一文件时，才开子代理；否则自己做。
+- 不做 brief 没要求的探索、复核和润色；结果可交付就停。"""
+        self.submit(JOB_ID)
+        self.env["AMB_SPEED_HINT"] = "0"
+        disabled = JOB_ID + "-off"
+        self.submit(disabled)
+        self.env.pop("AMB_SPEED_HINT")
+
+        for jid, enabled in ((JOB_ID, True), (disabled, False)):
+            with self.subTest(enabled=enabled):
+                st = self.tick_until(lambda s: s["state"] in TERMINAL, job_id=jid)
+                self.assertEqual(st["state"], "done")
+                prompt = (self.jobs / jid / "attempts/1/exec/prompt.md").read_text()
+                if enabled:
+                    self.assertTrue(prompt.endswith("\n\n" + expected_hint + "\n"))
+                else:
+                    self.assertNotIn("## 速度", prompt)
+                self.amb("delivered", jid)
+                rows = [json.loads(line) for line in (self.root / "stats.jsonl").read_text().splitlines()]
+                rows = [row for row in rows if row.get("id") == jid]
+                self.assertEqual({row["event"] for row in rows},
+                                 {"timing_dispatched", "timing_started", "done", "delivered"})
+                for row in rows:
+                    self.assertIs(row["speed_hint"], enabled)
+
     def test_exec_ok_with_passing_accept_reaches_done(self):
         self.submit()
         st = self.tick_until(lambda s: s["state"] in TERMINAL, what="terminal state")
@@ -307,6 +356,49 @@ class TestT2Lifecycle(T2Base):
         json.loads(first.read_text(encoding="utf-8"))  # 必须是合法 JSON
         self.assertIn("A1", first.read_text(encoding="utf-8"))
         self.assertTrue(st["attempt"] > 1 or st["state"] in {"blocked", "failed"}, st)
+
+    def test_default_exec_continues_past_legacy_45_minutes(self):
+        self.config["defaults"].pop("step_minutes")
+        gate = self.root / "finish-exec"
+        script = self.bin / "exec_wait"
+        script.write_text(
+            "#!/bin/sh\n"
+            f"while [ ! -f {shlex.quote(str(gate))} ]; do sleep 0.1; done\n"
+            f"exec {shlex.quote(str(FAKES / 'exec_ok.sh'))} \"$@\"\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        self.set_role("exec.sol", script)
+        self.submit(limits={"max_attempts": 3})
+        _, pid = self.wait_for_pid()
+        state_path = self.jobs / JOB_ID / "state.json"
+        st = self.state()
+        self.assertIsNone(st["run"]["timeout"])
+        st["run"]["started"] -= 46 * 60
+        write_json(state_path, st)
+        self.tick()
+        self.assertEqual(self.state()["attempt"], 1)
+        self.assertTrue(pid_alive(pid))
+        self.assertEqual(self.failures(), [])
+
+        gate.touch()
+        st = self.tick_until(lambda s: s["state"] in TERMINAL, timeout=20)
+        self.assertEqual(st["state"], "done")
+        self.assertEqual(st["attempt"], 1)
+
+    def test_explicit_45_minute_limit_applies_without_global_limit(self):
+        self.config["defaults"]["step_minutes"] = None
+        self.set_role("exec.sol", FAKES / "exec_hang.sh")
+        self.submit(limits={"step_minutes": 45, "max_attempts": 3})
+        _, pid = self.wait_for_pid()
+        st = self.state()
+        self.assertEqual(st["run"]["timeout"], 45 * 60)
+        st["run"]["started"] -= 46 * 60
+        write_json(self.jobs / JOB_ID / "state.json", st)
+
+        self.tick()
+        self.assertFalse(pid_alive(pid))
+        self.assertEqual(len(self.failures()), 1)
 
     def test_exec_hang_times_out_is_killed_and_counts_one_failure(self):
         self.set_role("exec.sol", FAKES / "exec_hang.sh")
@@ -457,7 +549,7 @@ class TestT2Robustness(T2Base):
         self.assertEqual(st["state"], "failed", st)
 
     def test_one_broken_job_does_not_stop_others(self):
-        broken = "J-0101-09"
+        broken = "J-1120-09"
         bdir = self.jobs / broken
         bdir.mkdir(parents=True)
         write_json(bdir / "job.json", {"id": broken, "kind": "code", "host": "local",

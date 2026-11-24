@@ -24,14 +24,20 @@ printf '%s\n' '{"summary":"local override"}' > "$3"
         self.assertFalse(self.history_to(st, "review"))
         self.assertTrue((Path(st["wt"]) / ".git").is_dir())
         self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.base_sha)
-        fallback = amb.role_argv(self.config, "exec.opus", {}, host="other-host")
+        fallback = amb.role_argv(self.config, "exec.opus", {}, host="kml-dev")
         self.assertEqual(Path(fallback[0]), FAKES / "exec_garbage.sh")
 
-    def test_code_without_accept_uses_review_with_executor_evidence(self):
+    def test_simple_code_l1_without_accept_skips_review(self):
+        self.submit(tier="L1", accept=[])
+        st = self.tick_until(lambda s: s["state"] in TERMINAL)
+        self.assertEqual(st["state"], "done", st)
+        self.assertFalse(self.history_to(st, "review"))
+
+    def test_code_l2_without_accept_uses_review_with_executor_evidence(self):
         executor = self.script("evidence.sh", """printf '%s\n' 'receipt: recorded-123' '{"summary":"did it","unverified":["first run"]}' > "$3"
 """)
         self.set_role("exec.sol", executor)
-        self.submit(tier="L1", accept=[])
+        self.submit(tier="L2", accept=[])
         st = self.tick_until(lambda s: s["state"] in TERMINAL)
         self.assertEqual(st["state"], "done", st)
         self.assertFalse(st.get("merged"))
@@ -78,24 +84,11 @@ class TestSupervisor(T4Base):
 
 
 class TestNotificationActivation(T4Base):
-    def test_activation_ignores_prior_state_and_backoff_preserves_pending(self):
-        self.done_job()
-        recorder = self.hook(codes=[400])
+    def test_activation_ignores_prior_state(self):
+        recorder = self.hook()
         self.config["notifications_since"] = "2099-01-01T00:00:00Z"
         self.config["webhook"] = {"url": recorder.url, "client_error_backoff_s": 60, "metadata_only": True}
         self.save_config()
-        self.tick()
+        self.done_job()
+        self.amb("_job-events")
         self.assertEqual(recorder.requests, [])
-        self.config.pop("notifications_since")
-        self.save_config()
-        self.tick()
-        self.tick()
-        self.assertEqual(len(recorder.requests), 1)
-        self.assertFalse(self.state()["notified"]["webhook"])
-        self.assertEqual(recorder.requests[0][1], {
-            "event_type": "ambition_amb_job_v1", "event_id": f"amb:{JOB_ID}:done", "id": JOB_ID, "state": "done",
-        })
-        (self.jobs / "_webhook" / "retry.json").unlink()
-        self.tick()
-        self.assertEqual(len(recorder.requests), 2)
-        self.assertEqual(self.state()["notified"]["webhook"], "done")

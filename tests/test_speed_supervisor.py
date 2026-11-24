@@ -24,12 +24,12 @@ class TestSpeedSupervisor(unittest.TestCase):
 
     def test_rate_limit_and_sentinel_only_for_new_decisions(self):
         now = 5000
-        alert = {"task": "J-0101-01", "phase": "review", "action": "needs_decision"}
+        alert = {"task": "J-1120-01", "phase": "review", "action": "needs_decision"}
         self.assertTrue(amb_speed.eligible({"runs": [now - 1]}, [alert], now))
         state = {"runs": [now - 3, now - 2, now - 1, now], "incidents": []}
         self.assertFalse(amb_speed.eligible(state, [alert], now))
         self.assertEqual(amb_speed.advice_events([alert], state), [alert])
-        state["incidents"] = ["J-0101-01:review"]
+        state["incidents"] = ["J-1120-01:review"]
         self.assertEqual(amb_speed.advice_events([alert], state), [])
         self.assertFalse(amb_speed.eligible({"runs": [now - 1], "incidents": state["incidents"]}, [alert], now))
 
@@ -65,6 +65,33 @@ class TestSpeedSupervisor(unittest.TestCase):
         send.assert_called_once()
         self.assertFalse(amb.read_json(path)[good["key"]]["pending"])
 
+    def test_direct_stall_reports_require_ten_minutes_without_nested_writes(self):
+        directory = self.direct / "fixture"
+        artifact = directory / "sim" / "runs" / "episodes.csv"
+        artifact.parent.mkdir(parents=True)
+        now = time.time()
+        for path in [artifact, *(directory / name for name in ("prompt.md", "out.md", "err.log", "log.txt"))]:
+            path.touch()
+            os.utime(path, (now - 601, now - 601))
+        (directory / "inbox").write_text("incoming message")
+        report = {"task": "fixture", "key": "fixture:无写入"}
+
+        def metadata():
+            return amb_speed.direct_metadata(amb, self.direct, self.work, now)
+
+        with patch.object(amb_speed.time, "time", return_value=now):
+            idle = metadata()
+            self.assertTrue(idle[0]["idle_10m"])
+            self.assertEqual(amb_speed.filter_direct_reports([report], idle, self.direct), [report])
+
+            artifact.write_text("episode completed")
+            os.utime(artifact, (now - 60, now - 60))
+            active = metadata()
+            self.assertEqual(active[0]["last_write_minutes"], 1)
+            self.assertFalse(active[0]["idle_10m"])
+            self.assertEqual(amb_speed.filter_direct_reports([report], active, self.direct), [])
+            self.assertEqual(amb_speed.filter_direct_reports([report], idle, self.direct), [])
+
     def test_only_revalidated_ready_children_are_started(self):
         for jid, state, job in (
             ("J-parent", {"state": "subs", "subs": ["J-child"]}, {}),
@@ -93,3 +120,22 @@ class TestSpeedSupervisor(unittest.TestCase):
                          {"actions": [], "reports": []})
         with self.assertRaises(ValueError):
             amb_speed.parse_reply('{"action": "shell"}')
+
+
+def test_leader_first_dispatch_measures_from_execution_start(tmp_path, monkeypatch):
+    monkeypatch.setenv("AMB_ROOT", str(tmp_path))
+    leader = {"id": "J-lead", "mode": "lead", "tier": "L1"}
+    children = [
+        ({"id": "J-late", "lead_parent": "J-lead"}, "exec", "1970-01-01T00:02:00Z"),
+        ({"id": "J-early", "lead_parent": "J-lead"}, "done", "1970-01-01T00:01:30Z"),
+    ]
+    for job, state, time in [(leader, "exec", "1970-01-01T00:00:30Z"), *children]:
+        amb.write_json(amb.jobs_dir(job["id"], "job.json"), job)
+        amb.write_json(amb.jobs_dir(job["id"], "state.json"), {
+            "state": state, "started_at": time, "dispatched_at": time,
+        })
+    active, _ = amb_speed.amb_metadata(amb, {}, 600)
+    row = next(item for item in active if item["id"] == "J-lead")
+    assert row["lead_first_dispatch_seconds"] == 60
+    assert row["lead_started_seconds_ago"] == 570
+    assert row["lead_children_active"] == 1

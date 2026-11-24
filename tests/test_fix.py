@@ -108,7 +108,7 @@ class TestFix7AcceptId(FixBase):
     def test_7_plan_with_bad_accept_id_is_bad_output(self):
         plan = self.script("plan_bad_id.sh", "cat > \"$3\" <<'J'\n"
                            '{"subs":[{"title":"s","accept":[{"id":"../../x","cmd":"true"}],"depends_on":[]}]}\nJ\n')
-        self.config["roles"]["plan.fable"] = {"cmd": f"{plan} {{workdir}} {{prompt_file}} {{out_file}}"}
+        self.config["roles"]["plan.opus"] = {"cmd": f"{plan} {{workdir}} {{prompt_file}} {{out_file}}"}
         self.save_config()
         self.submit(tier="L3")
         st = self.run_to_end()

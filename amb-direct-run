@@ -11,8 +11,16 @@ import sys
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
 from pathlib import Path
+
+# The installed copy in ~/bin shares the orchestrator's ledger and outbox.
+MODULE_DIR = Path(__file__).resolve().parent
+if not (MODULE_DIR / "amb_metrics.py").is_file():
+    MODULE_DIR = Path.home() / "amb"
+    sys.path.insert(0, str(MODULE_DIR))
+import amb_events
+import amb_metrics
+import amb_speed
 
 POLL_SECONDS = 5
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}\Z")
@@ -24,7 +32,7 @@ INBOX_INSTRUCTIONS = """追加指令会写入本任务目录的 inbox（每行�
 
 
 def stamp():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return amb_metrics.utc_now()
 
 
 def atomic_write(path, value):
@@ -48,9 +56,41 @@ def update_status(directory, status, phase, **details):
     atomic_write(directory / "status.json", json.dumps(status, ensure_ascii=False) + "\n")
 
 
-def finish(directory, status, code, **details):
-    update_status(directory, status, "done" if code == 0 else "failed", exit_code=code, **details)
+def record_timing(status, event):
+    amb_metrics.append(amb_root(), {
+        "ts": stamp(), "event": event, "source": "direct", "id": status["name"],
+        "state": status["phase"], "speed_hint": status["speed_hint"],
+        **{key: status.get(key) for key in amb_metrics.TIMES},
+    })
+
+
+def amb_root():
+    root = Path(os.environ.get("AMB_ROOT") or "~/amb").expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def finish(directory, status, code, phase=None, **details):
+    phase = phase or ("done" if code == 0 else "failed")
+    update_status(directory, status, phase, exit_code=code, finished_at=stamp(), **details)
+    result_path = directory / "out.md"
+    if not result_path.is_file():
+        result_path = directory / "result.md"
+        atomic_write(result_path, details.get("error") or f"任务 {phase}（退出码 {code}）\n")
     atomic_write(directory / "exit", f"{code}\n")
+    record_timing(status, phase)
+    with result_path.open(encoding="utf-8", errors="replace") as result:
+        summary = result.read(8192).strip() or f"任务 {phase}（退出码 {code}）"
+    root = amb_root()
+    amb_events.emit(root, status["name"], status["title"], phase, summary, result_path)
+    cli = MODULE_DIR / "amb.py"
+    if (root / "config.json").is_file() and cli.is_file():
+        try:
+            subprocess.Popen([sys.executable, str(cli), "_job-events"], start_new_session=True,
+                             env={**os.environ, "AMB_ROOT": str(root)},
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            pass  # The regular orchestrator tick also drains the outbox.
 
 
 def exit_code(path):
@@ -115,6 +155,9 @@ def agent_turn(args, directory, prompt, session, first):
 
 
 def run_task(args, base):
+    if any(value is not None and not value.strip() for value in (args.model, args.effort)):
+        raise ValueError("--model 和 --effort 必须是非空字符串")
+    created = stamp()
     brief = (sys.stdin.read() if args.prompt == "-" else
              Path(args.prompt).expanduser().read_text(encoding="utf-8"))
     if not brief.strip():
@@ -125,8 +168,10 @@ def run_task(args, base):
     directory = base / args.name
     directory.mkdir(mode=0o700)
     status = {
-        "schema_version": 1, "name": args.name, "agent": args.agent,
-        "pid": os.getpid(), "created_at": stamp(), "dependencies": args.after,
+        "schema_version": 1, "name": args.name, "title": args.title or args.name, "agent": args.agent,
+        "model": args.model, "effort": args.effort,
+        "pid": os.getpid(), "created_at": created, "asked_at": args.asked_at or created,
+        "dispatched_at": stamp(), "dependencies": args.after, "speed_hint": amb_speed.speed_hint_enabled(),
     }
     consumed = 0
     turn = 0
@@ -136,6 +181,7 @@ def run_task(args, base):
         (directory / "inbox").touch()
         (directory / "log.txt").touch()
         update_status(directory, status, "waiting", turn=turn)
+        record_timing(status, "timing_dispatched")
         print(directory, flush=True)
         waiting = [base / name / "exit" for name in args.after]
         while waiting:
@@ -145,12 +191,17 @@ def run_task(args, base):
                 if code is None:
                     remaining.append(prerequisite)
                 elif code != 0:
-                    raise ValueError(f"前置任务 {prerequisite.parent.name} 的退出码为 {code}")
+                    finish(directory, status, 1, "blocked",
+                           error=f"前置任务 {prerequisite.parent.name} 的退出码为 {code}")
+                    return 1
             waiting = remaining
             if waiting:
                 time.sleep(POLL_SECONDS)
         predecessor_dirs = "\n".join(str(base / name) for name in args.after)
-        prompt = brief + "\n\n" + INBOX_INSTRUCTIONS
+        parts = [brief]
+        if status["speed_hint"]:
+            parts.append(amb_speed.SPEED_HINT)
+        prompt = "\n\n".join([*parts, INBOX_INSTRUCTIONS])
         if predecessor_dirs:
             prompt += "\n\n前置任务已成功完成，产物在以下目录：\n" + predecessor_dirs
 
@@ -165,7 +216,11 @@ def run_task(args, base):
                         prompt = "继续处理本任务。以下是尚未确认的追加指令："
                     prompt += f"\n\n追加指令（序号与 inbox 行号一致）：\n{messages}"
                 turn += 1
+                if turn == 1:
+                    status["started_at"] = stamp()
                 update_status(directory, status, "running", turn=turn, session_id=session)
+                if turn == 1:
+                    record_timing(status, "timing_started")
             code, session = agent_turn(args, directory, prompt, session, first=(turn == 1))
             status["session_id"] = session
             if code:
@@ -174,9 +229,12 @@ def run_task(args, base):
                 return code
             consumed = delivered
     except (OSError, ValueError, KeyError, TypeError, KeyboardInterrupt, SystemExit) as exc:
+        if (directory / "exit").is_file():
+            raise
         code = exc.code if isinstance(exc, SystemExit) else 130 if isinstance(exc, KeyboardInterrupt) else 1
+        phase = "cancelled" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else "failed"
         with inbox_lock(directory):
-            finish(directory, status, code, error=str(exc) or "interrupted")
+            finish(directory, status, code, phase, error=str(exc) or "interrupted")
         if code == 1:
             print(f"amb-direct-run: {exc}", file=sys.stderr)
         return code
@@ -204,16 +262,25 @@ def task_name(value):
     return value
 
 
+def asked_at(value):
+    try:
+        return amb_metrics.normalize_asked(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     run = subparsers.add_parser("run", help="在新目录和新会话中执行任务")
     run.add_argument("name", type=task_name)
     run.add_argument("--prompt", required=True, help="任务指令文件，- 表示标准输入")
+    run.add_argument("--title")
+    run.add_argument("--asked-at", type=asked_at)
     run.add_argument("--after", action="append", default=[], type=task_name, help="前置任务名，可重复")
     run.add_argument("--agent", choices=["codex", "claude"], default="codex")
-    run.add_argument("--model")
-    run.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
+    run.add_argument("--model", help="仅覆盖本单执行模型")
+    run.add_argument("--effort", help="仅覆盖本单推理档位")
     message = subparsers.add_parser("send", help="向等待中或执行中的任务追加指令")
     message.add_argument("name", type=task_name)
     message.add_argument("message")

@@ -120,6 +120,8 @@ def record(root, jid, job, phase, clock, since, reason, action="needs_decision")
     }
     if job.get("test") is True:
         event["test"] = True
+    if job.get("campaign"):
+        event["campaign"] = job["campaign"]
     write_json(path, event)
 
 
@@ -147,7 +149,7 @@ def observe_state(root, jid, job, state, clock=None):
         record(root, jid, job, "human", clock, started, "等待人工处理超过 10 分钟")
 
 
-def output_growth(root, jid, run, progress, clock):
+def output_growth(root, jid, run, progress, clock, waiting_on_children=False):
     path = Path(root, "jobs", "_sentinel", "progress", jid + ".json")
     previous = read_json(path) or {}
     sizes = {name: size for name, (size, _) in progress.items() if size}
@@ -156,17 +158,19 @@ def output_growth(root, jid, run, progress, clock):
         last = max([started, *(min(clock, mtime) for size, mtime in progress.values() if size)])
     else:
         last = previous["last_growth"]
-        if sizes == previous["sizes"]:
+        if sizes == previous["sizes"] and not waiting_on_children:
             return last
         increases = [min(clock, mtime) for name, (size, mtime) in progress.items()
                      if size > previous["sizes"].get(name, 0)]
         last = max([last, *increases])
+    if waiting_on_children:
+        last = clock
     write_json(path, {"run": [run.get("dir"), started], "sizes": sizes, "last_growth": last})
     return last
 
 
-def observe_run(root, jid, job, run, poll, legacy_progress, clock=None):
-    phase = run["step"]
+def observe_run(root, jid, job, run, poll, legacy_progress, clock=None, *, waiting_on_children=False):
+    phase = "exec" if run["step"] == "repair" else run["step"]
     if phase not in ("plan", "exec", "review") or event_path(root, jid, phase).exists():
         return
     clock = time.time() if clock is None else clock
@@ -176,8 +180,9 @@ def observe_run(root, jid, job, run, poll, legacy_progress, clock=None):
         if progress is None and clock - started > LIMITS[phase]:
             progress = legacy_progress()
         if progress is not None:
-            started = output_growth(root, jid, run, progress, clock)
-            record(root, jid, job, phase, clock, started, "执行进程仍在运行，输出超过 10 分钟未增长")
+            started = output_growth(root, jid, run, progress, clock, waiting_on_children)
+            if not waiting_on_children:
+                record(root, jid, job, phase, clock, started, "执行进程仍在运行，输出超过 10 分钟未增长")
     else:
         reason = {"plan": "规划仍在运行，已超过 8 分钟", "review": "复核仍在运行，已超过 5 分钟"}[phase]
         record(root, jid, job, phase, clock, started, reason)
@@ -187,6 +192,6 @@ def recent_events(root, since=0):
     events = []
     for path in Path(root, "jobs", "_sentinel", "events").glob("*/*.json"):
         event = read_json(path)
-        if isinstance(event, dict) and (timestamp(event.get("ts")) or 0) >= since:
+        if isinstance(event, dict) and not event.get("campaign") and (timestamp(event.get("ts")) or 0) >= since:
             events.append(event)
     return sorted(events, key=lambda event: (event["ts"], event["event_id"]))

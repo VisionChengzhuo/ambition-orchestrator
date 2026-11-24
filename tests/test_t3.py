@@ -1,4 +1,5 @@
 """T3 黑盒测试：复核、升级链、合并（复用 T2 的夹具）。"""
+import json
 import shlex
 import unittest
 
@@ -59,6 +60,63 @@ class TestT3Ladder(T3Base):
 
 
 class TestT3Review(T3Base):
+    def configure_review_repair(self):
+        executor = self.script("repair.sh", """
+if grep -q '^## 本轮复核修复$' "$2"; then
+    grep -q 'fake review failure' "$2"
+    printf '%s\n' fixed >> "$1/DONE.txt"
+else
+    printf '%s\n' original > "$1/DONE.txt"
+fi
+printf '%s\n' '{"summary":"ok","unverified":[]}' > "$3"
+""")
+        reviewer = self.script("review_content.sh", f"""
+if grep -qx fixed "$1/DONE.txt"; then
+    exec {shlex.quote(str(FAKES / 'review_pass.sh'))} "$@"
+fi
+exec {shlex.quote(str(FAKES / 'review_fail.sh'))} "$@"
+""")
+        self.set_role("exec.sol", executor)
+        self.set_role("review.opus", reviewer)
+
+    def test_actionable_review_is_repaired_and_rechecked_in_same_attempt(self):
+        self.configure_review_repair()
+        self.submit(tier="L2", land="merge", limits={"step_minutes": 45, "max_attempts": 1})
+        st = self.run_to_end()
+        self.assertEqual((st["state"], st["attempt"]), ("done", 1), st)
+        self.assertEqual(self.main_sha(), st["review"]["sha"])
+        self.assertEqual(self.git("rev-list", "--count", f"{self.base_sha}..main").strip(), "1")
+        self.assertEqual((self.repo / "DONE.txt").read_text(), "original\nfixed\n")
+        self.assertEqual(len(self.history_to(st, "accept")), 2)
+        self.assertEqual(len(self.history_to(st, "review")), 2)
+        result = json.loads((self.jobs / JOB_ID / "result.json").read_text())
+        self.assertEqual([r["reason"] for r in result["rework"]], ["review_failed"])
+        self.assertTrue(result["rework"][0]["in_place"])
+        speed = json.loads(self.amb("speed", "--json").stdout)
+        self.assertEqual(speed["rework_rate_pct"], 0)
+
+    def test_rework_rate_over_18_finalizations(self):
+        self.configure_review_repair()
+        ids = [f"J-1120-{n:02d}" for n in range(1, 19)]
+        for index, jid in enumerate(ids):
+            self.submit(job_id=jid, tier="L2" if index < 2 else "L1")
+        self.tick_until(lambda _: all(self.state(jid)["state"] in TERMINAL for jid in ids))
+        for jid in ids:
+            self.assertEqual(self.state(jid)["state"], "done")
+        reopened = self.amb("reopen", ids[-1], "--reason", "补齐验收说明").stdout.strip()
+        state = self.tick_until(lambda st: st["state"] in TERMINAL, job_id=reopened)
+        self.assertEqual(state["state"], "done")
+        for jid in [*ids[:-1], reopened]:
+            self.amb("delivered", jid)
+        speed = json.loads(self.amb("speed", "--json").stdout)
+        self.assertEqual(speed["samples"]["delivery"], 18)
+        self.assertEqual(speed["samples"]["finalized"], 18)
+        self.assertEqual(speed["samples"]["reworked"], 1)
+        self.assertEqual(speed["rework_rate_pct"], 5.56)
+        rows = [json.loads(line) for line in (self.root / "stats.jsonl").read_text().splitlines()]
+        self.assertEqual([row["rework_reason"] for row in rows if row["event"] == "reopen"],
+                         ["user_reopened"])
+
     def test_review_fail_does_not_merge(self):
         self.set_role("review.opus", FAKES / "review_fail.sh")
         self.set_role("review.codex", FAKES / "review_fail.sh")
@@ -76,6 +134,8 @@ class TestT3Review(T3Base):
         st = self.run_to_end()
         self.assertNotEqual(st["state"], "done")
         self.assertEqual(self.main_sha(), self.base_sha)
+        self.assertTrue(all(r["sig"] == "review:sha" for r in st["rework"]))
+        self.assertFalse(list((self.jobs / JOB_ID).rglob("repair")))
 
     def test_review_uses_cross_family_reviewer_and_merges(self):
         self.submit(tier="L2", land="merge")

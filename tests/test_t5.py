@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class T5Base(T2Base):
     def setUp(self):
         super().setUp()
-        self.config["roles"]["plan.fable"] = {"cmd": role_cmd(FAKES / "plan_two_subs.sh"), "host": "local"}
+        self.config["roles"]["plan.opus"] = {"cmd": role_cmd(FAKES / "plan_two_subs.sh"), "host": "local"}
         self.config["repos"][f"local:{self.repo}"]["auto_merge"] = True
         self.save_config()
 
@@ -27,6 +27,49 @@ class T5Base(T2Base):
 
 
 class TestT5Plan(T5Base):
+    def test_short_l3_brief_goes_straight_to_l1(self):
+        self.set_role("plan.opus", FAKES / "exec_garbage.sh")
+        self.submit(tier="L3", brief="  " + "改" * 20 + "\n\t" + "改" * 20 + "  ")
+        st = self.run_to_end()
+        self.assertEqual(st["state"], "done", st)
+        self.assertTrue(st["direct_l1"])
+        self.assertFalse(self.history_to(st, "planning"))
+        self.assertFalse(self.history_to(st, "review"))
+        self.assertEqual(st["accept_results"][0]["result"], "pass")
+        self.assertIn("40 个非空白字符", st["history"][1]["why"])
+
+    def test_zero_or_one_planned_subtask_executes_original_task(self):
+        for count in (0, 1):
+            with self.subTest(count=count):
+                subs = [{"title": "unused child", "accept": [{"cmd": "false"}]}] * count
+                self.set_role("plan.opus", self.script("small_plan.sh",
+                    f"cat > \"$3\" <<'PLAN'\n{json.dumps({'subs': subs})}\nPLAN\n"))
+                jid = f"{JOB_ID}-small-{count}"
+                self.submit(job_id=jid, tier="L3", brief="原" * 41)
+                st = self.tick_until(lambda s: s["state"] in TERMINAL, job_id=jid)
+                self.assertEqual((st["state"], st["attempt"]), ("done", 1), st)
+                self.assertTrue(st["direct_l1"])
+                self.assertEqual(len(self.history_to(st, "planning")), 1)
+                self.assertFalse(self.history_to(st, "subs"))
+                self.assertFalse(self.history_to(st, "review"))
+                self.assertFalse(list(self.jobs.glob(f"{jid}.a*s*")))
+                self.assertEqual(st["accept_results"][0]["result"], "pass")
+                self.assertEqual(st["attempts"]["1"]["plan"], "plan.opus")
+                prompt = (self.jobs / jid / "attempts/1/exec/prompt.md").read_text()
+                self.assertTrue(prompt.startswith("原" * 41))
+
+    def test_small_plan_fallback_cannot_request_planning_again(self):
+        self.set_role("plan.opus", self.script("empty_plan.sh", """printf '%s\n' '{"subs":[]}' > "$3"
+"""))
+        self.set_role("exec.sol", self.script("need_plan_again.sh", """printf '%s\n' '{"summary":"need help","needs_plan":true}' > "$3"
+"""))
+        self.submit(tier="L2")
+        st = self.run_to_end()
+        self.assertEqual((st["state"], st["attempt"]), ("blocked", 2))
+        self.assertTrue(st["direct_l1"])
+        self.assertEqual(len(self.history_to(st, "planning")), 1)
+        self.assertIn("needs_plan", st["needs_human"])
+
     def test_two_subs_run_in_order_and_parent_done(self):
         self.submit(tier="L3", land="merge", accept=[{"id": "A1", "cmd": "test $(wc -l < DONE.txt) -eq 2"}])
         st = self.run_to_end()
@@ -35,6 +78,7 @@ class TestT5Plan(T5Base):
         self.assertEqual(len(subs), 2)
         s1, s2 = (json.loads((self.jobs / s / "state.json").read_text(encoding="utf-8")) for s in subs)
         self.assertEqual((s1["state"], s2["state"]), ("done", "done"))
+        self.assertEqual(st["attempts"]["1"]["plan"], "plan.opus")
         self.assertLess(s1["history"][-1]["ts"], s2["history"][1]["ts"] + "~")
         # s2 建在 s1 之上：s1.sha 是 s2.sha 的祖先
         self.git("merge-base", "--is-ancestor", s1["sha"], s2["sha"])
@@ -54,7 +98,7 @@ class TestT5Plan(T5Base):
         self.assertIn("子任务", st["needs_human"])
 
     def test_invalid_plan_is_bad_output(self):
-        self.set_role("plan.fable", FAKES / "exec_garbage.sh")
+        self.set_role("plan.opus", FAKES / "exec_garbage.sh")
         self.submit(tier="L3", limits={"step_minutes": 45, "max_attempts": 3})
         st = self.run_to_end()
         self.assertEqual(st["state"], "blocked", st)
@@ -66,7 +110,7 @@ class TestT5Plan(T5Base):
         bad = self.script("plan_bad.sh", "cat > \"$3\" <<'J'\n"
                           '{"accept":[{"id":"A1","cmd":"true"}],"subs":[{"title":"s","host":"local",'
                           '"accept":[{"id":"A1","cmd":"true"}],"depends_on":[]}]}\nJ\n')
-        self.set_role("plan.fable", bad)
+        self.set_role("plan.opus", bad)
         self.submit(tier="L3")
         st = self.run_to_end()
         self.assertEqual(st["state"], "blocked")
@@ -91,11 +135,37 @@ class TestT5Plan(T5Base):
         self.assertEqual(st["state"], "done", st)
         self.assertTrue(st["escalated_to_l3"])
         self.assertEqual(len(self.history_to(st, "planning")), 1)
+        self.assertEqual(st["attempts"]["2"]["plan"], "plan.opus")
         prompt = (self.jobs / JOB_ID / "attempts" / "2" / "plan" / "prompt.md").read_text()
         self.assertIn("dependency unknown", prompt)
 
+    def test_l1_explicit_needs_plan_blocks_without_planning(self):
+        signal = self.script("need_plan.sh", """printf '%s\n' '{"summary":"dependency unknown","needs_plan":true}' > "$3"
+""")
+        self.set_role("exec.sol", signal)
+        self.submit(tier="L1")
+        st = self.run_to_end()
+        self.assertEqual((st["state"], st["attempt"]), ("blocked", 1))
+        self.assertIn("dependency unknown", st["needs_human"])
+        self.assertFalse(self.history_to(st, "planning"))
+
+    def test_ask_goes_direct_even_if_tier_is_l3(self):
+        self.submit(tier="L3", kind="ask", exec="ask", accept=[])
+        st = self.run_to_end()
+        self.assertEqual(st["state"], "done", st)
+        self.assertFalse(self.history_to(st, "planning"))
+
+    def test_fable_planner_requires_explicit_configuration(self):
+        self.set_role("plan.fable", FAKES / "plan_two_subs.sh")
+        self.config["planner"] = "plan.fable"
+        self.save_config()
+        self.submit(tier="L3")
+        st = self.run_to_end()
+        self.assertEqual(st["state"], "done", st)
+        self.assertEqual(st["attempts"]["1"]["plan"], "plan.fable")
+
     def test_plan_timeout_blocks_on_first_attempt(self):
-        self.set_role("plan.fable", self.script("plan_hang.sh", "sleep 30\n"))
+        self.set_role("plan.opus", self.script("plan_hang.sh", "sleep 30\n"))
         self.submit(tier="L3", limits={"plan_minutes": 0.01, "step_minutes": 45, "max_attempts": 3})
         self.tick()
         exit_file = self.jobs / JOB_ID / "attempts" / "1" / "plan" / "exit"
@@ -123,13 +193,15 @@ class TestT5Plan(T5Base):
         self.submit(job_id=jid, tier="L2", kind="doc", accept=[], checklist=["证据充分"])
         st = self.tick_until(lambda s: s["state"] in TERMINAL, job_id=jid)
         self.assertEqual((st["state"], st["attempt"], st["exec"]), ("blocked", 2, "opus"))
-        self.assertEqual(len(self.history_to(st, "review")), 2)
+        self.assertEqual(len(self.history_to(st, "review")), 4)
+        self.assertEqual(sum(r.get("in_place", False) for r in st["rework"]), 2)
         self.assertFalse(self.history_to(st, "planning"))
 
     def test_stale_plan_flag_cannot_route_l2_to_planner(self):
         self.submit(tier="L2")
         st = self.state()
         st["plan_needed"] = True
+        st["escalated_to_l3"] = True
         write_json(self.jobs / JOB_ID / "state.json", st)
         st = self.run_to_end()
         self.assertEqual(st["state"], "done")
@@ -138,20 +210,23 @@ class TestT5Plan(T5Base):
     def test_l3_large_stdout_plan_advances_to_subs(self):
         plan = self.script("long_plan.sh", """python3 - <<'PY'
 import json
-print(json.dumps({"subs": [{"title": "s", "brief": "x" * 210000, "accept": [{"cmd": "true"}]}]}))
+print(json.dumps({"subs": [
+    {"title": "s", "brief": "x" * 210000, "accept": [{"cmd": "true"}]},
+    {"title": "t", "accept": [{"cmd": "true"}]},
+]}))
 PY
 """)
-        self.set_role("plan.fable", plan)
+        self.set_role("plan.opus", plan)
         self.submit(tier="L3")
         st = self.tick_until(lambda s: s["state"] == "subs")
-        self.assertEqual(len(st["subs"]), 1)
+        self.assertEqual(len(st["subs"]), 2)
         self.assertEqual(len(json.loads((self.jobs / JOB_ID / "attempts/1/plan.json").read_text())
                              ["subs"][0]["brief"]), 210000)
 
     def test_planner_nonzero_exit_is_reported_even_with_valid_json(self):
         plan = self.script("failed_plan.sh", f"{shlex.quote(str(FAKES / 'plan_two_subs.sh'))} \"$@\"\n"
                            "echo 'planner command failed' >&2\nexit 7\n")
-        self.set_role("plan.fable", plan)
+        self.set_role("plan.opus", plan)
         self.submit(tier="L3", limits={"max_attempts": 1})
         st = self.run_to_end()
         fail = json.loads(self.failures()[0].read_text())

@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 set -eu
 
-python3 - "$3" <<'PY'
+repo_line=$(grep -m 1 '^REPO: ' -- "$2")
+python3 - "${repo_line#REPO: }" "$3" <<'PY'
 import json
 import sys
 
-out_file = sys.argv[1]
+repo, out_file = sys.argv[1:]
 subtasks = [
     {
         "title": title,
+        "host": "local",
+        "repo": repo,
         "exec": "sol",
         "accept": [{"id": "A1", "cmd": "test -f DONE.txt"}],
         "depends_on": dependencies,

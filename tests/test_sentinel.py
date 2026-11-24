@@ -1,4 +1,5 @@
 """Sentinel rules and their integration into genuine ticks with a local runner."""
+import fcntl
 import json
 import os
 import time
@@ -27,10 +28,9 @@ class TestSentinel(T2Base):
         executor = self.script("stalls.sh", "echo began\nsleep 30\n")
         self.set_role("exec.sol", executor)
         self.submit()
-        self.tick()
+        _, pid = self.wait_for_pid()
         st = self.state()
         run_dir = Path(st["run"]["dir"])
-        pid = int((run_dir / "pid").read_text().split()[0])
         log = run_dir / "stdout"
         for _ in range(100):
             if log.exists() and log.stat().st_size:
@@ -74,12 +74,24 @@ class TestSentinel(T2Base):
         sentinel.observe_run(self.root, JOB_ID, {}, run, touched, None, now + 2)
         self.assertEqual([event["phase"] for event in self.events()], ["exec"])
 
+    def test_leader_waiting_on_children_starts_a_fresh_idle_window(self):
+        clock = time.time()
+        run = {"step": "exec", "started": clock - 1000}
+        silent = {"progress": {"stdout": [100, clock - 900]}}
+        sentinel.observe_run(self.root, JOB_ID, {}, run, silent, None, clock, waiting_on_children=True)
+        sentinel.observe_run(self.root, JOB_ID, {}, run, silent, None, clock + 600)
+        self.assertEqual(self.events(), [])
+        sentinel.observe_run(self.root, JOB_ID, {}, run, silent, None, clock + 601)
+        self.assertEqual([event["phase"] for event in self.events()], ["exec"])
+
     def test_ready_queue_is_repaired_in_same_tick(self):
-        self.submit()
-        st = self.state()
-        st["history"][-1]["ts"] = iso(time.time() - 121)
-        write_json(self.jobs / JOB_ID / "state.json", st)
-        self.tick()
+        with (self.root / ".tick.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.submit()
+            st = self.state()
+            st["history"][-1]["ts"] = iso(time.time() - 121)
+            write_json(self.jobs / JOB_ID / "state.json", st)
+        self.amb("tick", "--wake")
         [event] = self.events()
         self.assertEqual((event["phase"], event["action"]), ("queue", "tick"))
         self.assertNotEqual(self.state()["state"], "queued")

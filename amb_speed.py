@@ -9,11 +9,26 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from stat import S_ISREG
+
+import amb_metrics
 
 TASK_ID = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 HOUR = 3600
 PERIOD = 900
+DIRECT_IDLE_SECONDS = 600
+DIRECT_IDLE_KEY = "无写入"
 LIMIT_BYTES = 8192
+CLAUDE = "/opt/amb/claude-full"
+SPEED_HINT = """## 速度
+- 目标是最快把可验证的结果交到用户手上。
+- 互不依赖、各自要等的步骤（远程命令、下载、测试、多机检查）放到后台同时跑，不串行等待。
+- 只有在至少两块工作互不依赖、各需数分钟以上、且不改同一文件时，才开子代理；否则自己做。
+- 不做 brief 没要求的探索、复核和润色；结果可交付就停。"""
+
+
+def speed_hint_enabled():
+    return os.environ.get("AMB_SPEED_HINT", "1") != "0"
 
 
 def age_minutes(now, start):
@@ -40,6 +55,10 @@ def amb_metadata(amb, cfg, now):
         except amb.AmbError:
             continue
     states = {jid: st.get("state") for jid, (_, st) in jobs.items()}
+    delegated = {}
+    for child, (job, state) in jobs.items():
+        if job.get("lead_parent"):
+            delegated.setdefault(job["lead_parent"], []).append((job, state))
     current, completed = [], {}
     day = int(now // 86400) * 86400
     for jid, (job, st) in jobs.items():
@@ -47,7 +66,7 @@ def amb_metadata(amb, cfg, now):
         for stage, minutes, begin, ended in stages:
             if begin >= day and ended:
                 completed.setdefault(stage, []).append(minutes)
-        if states[jid] in amb.TERMINAL:
+        if states[jid] in amb.TERMINAL or job.get("campaign"):
             continue
         attempt = st.get("attempt", 0)
         models = (st.get("attempts") or {}).get(str(attempt)) or {}
@@ -65,7 +84,20 @@ def amb_metadata(amb, cfg, now):
         ready = [child for child in st.get("subs") or []
                  if states.get(child) == "queued" and not jobs[child][1].get("run")
                  and all(states.get(dep) == "done" for dep in jobs[child][0].get("depends_on") or [])]
+        lead = {}
+        if amb.is_leader(job, st, cfg):
+            children = delegated.get(jid, [])
+            started = amb_metrics.timestamp(st.get("started_at"))
+            dispatches = [at for child, child_st in children
+                          if (at := amb_metrics.timestamp(amb.job_timing(child, child_st)["dispatched_at"])) is not None]
+            lead = {
+                "lead_first_dispatch_seconds": round(max(0, min(dispatches) - started), 1)
+                if started is not None and dispatches else None,
+                "lead_started_seconds_ago": round(max(0, now - started), 1) if started is not None else None,
+                "lead_children_active": sum(child_st.get("state") not in amb.TERMINAL for _, child_st in children),
+            }
         current.append({
+            **lead,
             "id": jid, "tier": job.get("tier"), "kind": job.get("kind"), "role": role,
             "model": (models.get("review_model") if state == "review" else models.get("plan_model")
                       if state == "planning" else models.get("exec_model")) or (amb.role_model(cfg, role) if role else None),
@@ -88,6 +120,23 @@ def file_stat(path):
         return None
 
 
+def direct_last_write(directory):
+    """Use task file mtimes, excluding inbox traffic and runner internals."""
+    latest = 0
+    for root, dirs, files in os.walk(directory):
+        dirs[:] = [name for name in dirs if name != ".git" and not name.startswith(".agent-message-")]
+        if root == os.fspath(directory):
+            files = set(files) - {"inbox", "inbox.ack", ".inbox.lock", ".inbox.ack.tmp"}
+        for name in files:
+            try:
+                info = os.lstat(os.path.join(root, name))
+            except OSError:
+                continue
+            if S_ISREG(info.st_mode):
+                latest = max(latest, info.st_mtime)
+    return latest
+
+
 def direct_metadata(amb, direct_root, work, now, sample=False):
     previous = amb.read_json(work / "direct-samples.json", {}) or {}
     current, samples = [], {}
@@ -99,9 +148,7 @@ def direct_metadata(amb, direct_root, work, now, sample=False):
             continue
         out, err = file_stat(directory / "out.md"), file_stat(directory / "err.log")
         log = file_stat(directory / "log.txt")
-        meta_stat = file_stat(directory / "status.json")
-        files = [s for s in (prompt, out, err, log, meta_stat, file_stat(directory)) if s]
-        updated = max(s.st_mtime for s in files)
+        updated = direct_last_write(directory)
         if now - updated >= 24 * HOUR:
             continue
         meta = amb.read_json(directory / "status.json", {}) or {}
@@ -132,6 +179,7 @@ def direct_metadata(amb, direct_root, work, now, sample=False):
             "growth_10m": dict(zip(("out.md", "err.log", "log.txt"),
                                    (latest - prior for latest, prior in zip(sizes, old[1:])))) if old else None,
             "last_write_minutes": age_minutes(now, updated),
+            "idle_10m": now - updated >= DIRECT_IDLE_SECONDS,
         })
     if sample and samples != previous:
         amb.write_json(work / "direct-samples.json", samples, mode=0o600)
@@ -149,7 +197,7 @@ def today_stats(amb, now, medians):
                     if amb.parse_time(entry["ts"]).timestamp() < day:
                         continue
                     cancelled += entry.get("event") == "cancelled"
-                    reopened += entry.get("event") == "reopened"
+                    reopened += entry.get("event") in ("reopen", "reopened")
                 except (KeyError, ValueError, TypeError):
                     continue
     except FileNotFoundError:
@@ -197,20 +245,8 @@ def advice_events(events, state):
             and incident_key(event) not in handled]
 
 
-def supervisor_command(cfg):
-    settings = cfg.get("speed_supervisor")
-    if not isinstance(settings, dict) or settings.get("enabled") is not True:
-        return None
-    host, cmd = settings.get("host"), settings.get("cmd")
-    if (not isinstance(host, str) or host not in (cfg.get("hosts") or {})
-            or not isinstance(cmd, list) or not cmd
-            or not all(isinstance(arg, str) and arg for arg in cmd)):
-        raise ValueError("speed_supervisor requires a configured host and a non-empty command argv")
-    return host, cmd
-
-
 def schedule(amb, cfg):
-    if supervisor_command(cfg) is None:
+    if not cfg.get("speed_supervisor"):
         return
     import amb_sentinel
     work = work_dir(amb)
@@ -220,6 +256,7 @@ def schedule(amb, cfg):
     direct = direct_metadata(amb, direct_root, work, now, sample=True)
     active = direct or any(
         (amb.read_json(amb.jobs_dir(jid, "state.json"), {}) or {}).get("state") not in (*amb.TERMINAL, None)
+        and not (amb.read_json(amb.jobs_dir(jid, "job.json"), {}) or {}).get("campaign")
         for jid in amb.list_jobs()
     )
     state = amb.read_json(work / "run.json", {}) or {}
@@ -263,11 +300,31 @@ def forward_pending(amb, cfg, path, seen):
         if not record.get("pending"):
             continue
         try:
-            amb_sentinel.append_outbox(amb, cfg, record["entry"])
+            entry = record["entry"]
+            job = amb.read_json(amb.jobs_dir(entry["task"], "job.json"), {}) or {}
+            if job.get("campaign"):
+                amb.campaign_alert(cfg, job, entry["event_id"], entry["reason"])
+            else:
+                amb_sentinel.append_outbox(amb, cfg, entry)
         except (amb.HostDown, amb.StepError, OSError, ValueError):
             break  # durable queue, retry on next tick without repeating the model
         record["pending"] = False
         amb.write_json(path, seen, mode=0o600)
+
+
+def filter_direct_reports(reports, direct, direct_root):
+    running = {job["dir"]: job for job in direct if job["stage"] in ("running", "unknown")}
+    allowed = []
+    for report in reports:
+        task = report.get("task") if isinstance(report, dict) else None
+        if isinstance(task, str) and task in running:
+            directory = direct_root / task
+            if (report.get("key") != task + ":" + DIRECT_IDLE_KEY or not running[task]["idle_10m"]
+                    or (directory / "exit").exists()
+                    or time.time() - direct_last_write(directory) < DIRECT_IDLE_SECONDS):
+                continue
+        allowed.append(report)
+    return allowed
 
 
 def apply_actions(amb, cfg, actions, tasks):
@@ -301,10 +358,8 @@ def apply_actions(amb, cfg, actions, tasks):
 
 def review(amb, cfg):
     import amb_sentinel
-    command = supervisor_command(cfg)
-    if command is None:
+    if not cfg.get("speed_supervisor"):
         return
-    host_name, argv = command
     work = work_dir(amb)
     work.mkdir(mode=0o700, parents=True, exist_ok=True)
     with open(work / ".lock", "a") as lock:
@@ -347,8 +402,10 @@ def review(amb, cfg):
         state["coverage"] = coverage
         amb.write_json(state_path, state, mode=0o600)
         prompt = Path(__file__).with_name("speed-supervisor-prompt.md").read_text(encoding="utf-8")
-        host = amb.Host(cfg, host_name)
-        cmd = ["sh", "-c", 'cd /tmp && exec "$@"', "sh", "timeout", "300", *argv]
+        host = amb.Host(cfg, "kml-dev")
+        cmd = ["sh", "-c", 'cd /tmp && exec "$@"', "sh", "timeout", "300", "bash", CLAUDE,
+               "-p", "--model", "claude-opus-5-5", "--effort", "medium", "--permission-mode", "plan",
+               "--no-session-persistence", "--tools", ""]
         try:
             schema = ('输出字段示例（id、task 必须用 digest 中的原始编号）'
                       '\n{"actions":[{"do":"start_ready","id":"J-0000-01.a1s01"}],'
@@ -364,6 +421,7 @@ def review(amb, cfg):
         report_tasks = tasks | {job["dir"] for job in digest["direct"]} | {
             event["task"] for event in digest["sentinel"]
         }
-        record_reports(amb, seen_path, seen, reply["reports"], report_tasks)
+        reports = filter_direct_reports(reply["reports"][:3], digest["direct"], direct_root)
+        record_reports(amb, seen_path, seen, reports, report_tasks)
         forward_pending(amb, cfg, seen_path, seen)
         apply_actions(amb, cfg, reply["actions"], tasks)
