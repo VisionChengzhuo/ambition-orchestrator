@@ -1,4 +1,4 @@
-"""Live planner, delegated results, and campaign routing."""
+"""Live planner, delegated results."""
 import json
 import shlex
 import tempfile
@@ -7,7 +7,6 @@ from pathlib import Path
 from unittest import mock
 
 import amb
-import amb_sentinel
 from tests.test_t5 import T5Base
 from tests.test_t2 import JOB_ID
 
@@ -192,20 +191,3 @@ def test_alignment_retries_only_failed_channel_and_preserves_text():
         assert "".join(message.split("\n\n", 1)[1] for message, _ in feishu_calls) == content
         assert linear_calls[1] == linear_calls[2]
         assert len({key for _, key in feishu_calls}) == len(feishu_calls)
-
-
-def test_campaign_terminal_and_watchdog_stay_in_campaign(tmp_path, monkeypatch):
-    monkeypatch.setenv("AMB_ROOT", str(tmp_path / "amb"))
-    cfg = {"autoresearch_root": str(tmp_path / "campaigns"), "notifications_since": "2099-01-01T00:00:00Z"}
-    job = {"id": JOB_ID, "campaign": "study"}
-    state = {"state": "done"}
-    with mock.patch.object(amb.amb_events, "emit") as emit:
-        amb.webhook_send(JOB_ID, job, state, cfg, "result.md", "结束")
-        amb_sentinel.record(amb.root(), JOB_ID, job, "queue", 1000, 20, "排队告警")
-        amb.route_campaign_sentinel(cfg, job, ("queue",))
-        amb.route_campaign_sentinel(cfg, job, ("queue",))
-        amb.card_event(job, "card-stale", "卡片进度告警", cfg)
-        emit.assert_not_called()
-    events = [json.loads(line) for line in Path(amb.campaign_events_path(cfg, "study")).read_text().splitlines()]
-    assert [event["state"] for event in events] == ["done", "alert", "alert"]
-    assert not amb_sentinel.recent_events(amb.root())

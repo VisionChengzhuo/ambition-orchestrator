@@ -2,6 +2,31 @@
 
 Ambition 是一个由 Python 标准库实现的任务编排器。它接收代码、文档和只读查询任务，在本机或通过 SSH 在配置的主机上运行执行者，并记录验收、复核与交付结果。
 
+## 使用场景
+
+| 入口或请求 | 派活方式 |
+| --- | --- |
+| Grok Bot 等聊天助手收到“帮我修测试”“查这条日志”“整理这份文档” | 加载唯一的派活 Skill [ambition-dispatch](skill/ambition-dispatch/SKILL.md)，通过工具入口在调度主机上创建并提交任务，向对话返回任务 ID。 |
+| 工程师在终端主动派单 | 直接使用 `amb.py new`、`submit`、`status` 和 `result`。能直接执行的任务用 L1，需要复核用 L2，需要先规划并调度有依赖的步骤用 L3。 |
+| 聊天里问“到哪了”或补充要求 | 根据对话里保存的任务 ID 用 `status` 或 `result` 查证，用 `send <id> '<用户原话>'` 追加到同一单。 |
+| 维护编排器或调度器故障 | 在能运行执行者的主机上使用 `amb-direct-run`。 |
+
+### Grok Bot 接入
+
+1. 在调度主机部署本仓库，先按下方步骤跑通本地示例，再将模拟角色换成实际执行命令并启用定时调度。允许 Bot 的工具调用在调度主机上运行 `python3 ~/amb/amb.py` 和编辑该单的草稿文件。Bot 与调度器分开部署时，由接入方通过 SSH 或自己的工具桥接接过去。
+2. 把 [派活 Skill](skill/ambition-dispatch/SKILL.md) 全文装入 Bot 的 Skill 或系统指令，并对应部署里的主机、角色和命令。Skill 中的 VPS/开发机是部署角色，Linear 和飞书条款适用于启用了这些集成的工作区。使用示例配置时，回话以 CLI 查到的状态和结果为准。
+3. Bot 收到请求后选择任务类型、档位和主机。例：“帮我查失败的单测并修一下”，在 `repos` 配置目标仓库后建代码单，将用户原话和执行者不可自行取得的必要材料写入草稿，随后提交并返回任务 ID。
+
+   ```bash
+   python3 ~/amb/amb.py new --kind code --tier L2 --host local --repo my-repo --exec sol --once --goal '修复失败单测，相关测试通过'
+   # 在返回的任务 ID 对应的 jobs/_draft/<id>/ 编辑 brief.md 和 job.json
+   python3 ~/amb/amb.py submit <id>
+   ```
+
+4. 保存任务 ID 与原会话的对应关系。启用 webhook 后，可用 `amb_job_event` 将进度或完成结果送回原对话。进度按 `event_id` 去重，完成按 `id` 和 `state` 去重。`result_path` 是调度主机上的路径，Bot 可从同一个工具入口读取。没有 webhook 时，Bot 用 `status <id>`、`result <id>` 查询。回报注明实际结果、验收证据和仍需用户决定的事项。
+
+以上接入需要 Bot 提供工具调用能力和部署时选择的回调接收端。
+
 ## 架构
 
 - `amb.py` 提供命令行、磁盘任务队列、状态机和步骤运行器。`tick` 推进队列，读取目标主机的执行状态，并在主机恢复可达后继续任务。代码在独立 Git worktree 中执行，文档使用单独的工作目录和 Git 仓库。启用 `runner_wake` 后，新运行器写入 `exit` 时触发一次 tick。远程步骤通过 SSH 等待该文件，连接中断时由每分钟 cron 补跑。
@@ -14,6 +39,7 @@ Ambition 是一个由 Python 标准库实现的任务编排器。它接收代码
 使用有 Python 3.12、Git 和 Bash 的 Linux 主机。将仓库检出到 `~/amb`。可选的定时调度需要 cron 和 flock，远程执行需要 SSH。
 
 ```bash
+git clone https://github.com/VisionChengzhuo/ambition-orchestrator.git ~/amb
 cd ~/amb
 cp -n config.example.json config.json
 python3 amb.py --help
@@ -68,11 +94,9 @@ python3 amb.py result "$id"
 
 任务目录默认为 `~/amb-direct/<任务名>`，可通过 `AMB_DIRECT_ROOT` 设置根目录。`send` 将指令写入 `inbox`，执行者可在执行过程中读取。当轮结束后，未确认的指令进入同一会话的下一轮。结果见 `out.md`，状态见 `status.json`，Codex 事件见 `log.txt`，错误输出见 `err.log`，最终退出码见 `exit`。
 
-## Skills
+## 派活 Skill
 
 [ambition-dispatch](skill/ambition-dispatch/SKILL.md) 定义如何按难度选择执行者、填写任务、读取进度和回报证据。将该目录放入所用代理的 skill 搜索路径，并确认代理能够调用 `amb.py`。其通知处理约定也可用于已配置的 webhook 接收端。
-
-[autoresearch](skill/autoresearch/SKILL.md) 定义怎样组织跨多轮推进的研究课题。安装方式相同。用到的 `ar` 运行时需由部署者另外配置。
 
 Linear 应用集成可通过 `linear.app_cmd` 接入，飞书结果投递可配置 `AMB_JOB_DELIVER_HELPER`。部署时可将 GPU 规则文件路径设置在 `AMB_H200_RULES`，由编排器按任务内容引用。
 

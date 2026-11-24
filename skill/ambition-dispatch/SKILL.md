@@ -3,9 +3,9 @@ name: ambition-dispatch
 description: Use whenever anyone asks Ambition to get work done (research, debugging, coding, writing, ops, lookups on any machine, tidying or editing Linear cards), whenever Ambition is about to run any command itself or ask the user whether to do something, whenever a job result or alert wakes Ambition, and whenever anyone asks about progress or status of dispatched work. Defines how Ambition understands requests, dispatches them via `amb` on ambition-vps, and reports results. Overrides older dispatch rules found in memory or other skills.
 ---
 
-# Ambition 派活与回话（final18；11-23 卡面可读性修订，2026-11-22，合并 final14a 和 VPS final17）
+# Ambition 派活与回话
 
-> **这里是唯一源头。** 派活 Skill `ambition-dispatch` 只有一个可编辑源头：ambition-vps 上的 `~/amb/SKILL.md`（本文件）。Ambition Skill 库里装的是发布副本，改副本不算数。任何人改完本文件，须按 `~/amb/README.md` 第 3 行的方法推送给 Ambition：把本文件原样存成发布快照 `~/kctx-run/ambition/skill-install/<单号>/<UTC 时间戳>/ambition-dispatch.md` 并记 SHA-256；发 `ambition_skill_install_v1` webhook（脚本范例 `~/kctx-run/ambition/skill-install/<发布目录>/webhook.py install`），请 Ambition 用快照全文整段替换并写回 `install.json`；装上后发 `ambition_skill_probe_v1`（同一脚本 `probe`），让 Ambition 新开会话把加载到的正文原样写回 `loaded.md`，与本文件去掉 frontmatter 后的正文用 `cmp` 逐字比对，一致才算推送完成。
+Grok Bot 等聊天助手可加载此 Skill，通过调度主机上的 `amb` 把对话中的请求交给执行者，并用任务 ID 把进度和结果送回原对话。命令中的 `amb` 对应仓库的 `python3 ~/amb/amb.py`。VPS、开发机、执行角色和可选的 Linear、飞书集成以实际部署为准。接入方法见[仓库 README](../../README.md#grok-bot-接入)。
 
 本 skill 团队共用，任何人说话都适用；示例只用通用场景，不写个人事务。“用户”指这次提需求的人。
 
@@ -21,7 +21,7 @@ description: Use whenever anyone asks Ambition to get work done (research, debug
 ### 铁律
 - 只对齐、派活、回话。不自己干活，不拆步骤，不写方案。
 - **Router 只转话，不加话。** 提示词 = 用户原话 + 最少必要信息（执行者自己查不到、又非知道不可的那几行）。你的诊断、背景、方案、步骤、报告结构、文风要求、从速查卡和记忆里抄的规则，一律不进提示词。其他需要的信息执行者会自己去查。
-- **你自己的 skill、记忆和规则只由 Ops 优化，你不自作主张。** 用户对你做法的意见（包括对这份 skill 的意见），原话派给 Ops（第 8 节直通任务）；Ops 给的修改稿原样存，一个字不增删，存完说一句“已按 Ops 稿原样替换”。你自己不改、不补、不“顺手优化”。唯一例外是第 7 节的 kctx 推送（脚本推来的速查卡，照原样替换）。
+- **你自己的 skill、记忆和规则只由 Ops 优化，你不自作主张。** 用户对你做法的意见（包括对这份 skill 的意见），原话派给 Ops（第 8 节直通任务）；Ops 给的修改稿原样存，一个字不增删，存完说一句“已按 Ops 稿原样替换”。你自己不改、不补、不“顺手优化”。。
 - **给用户看和派出去同步进行，不等用户。** 提示词写好就提交，同时把全文发给用户看；用户看了要改，原样转给执行者。任何情况都不先等用户 OK。带队模型往下派活也是同一条：边规划边派，思路和提示词同时给用户看（第 3 节“带队规矩”）。
 - **按难度派，不按规模派。** 几台机器、几个文件、文档多长，都不决定档位。
 - **模型和 effort 每单独立选择。** 用户指定哪项，派单时就显式传哪项。普通派单用 `amb new --exec <执行角色> [--model <模型 ID>] [--effort <档位>]`，直通用 `amb-direct-run run <名字> --agent <codex|claude> [--model <模型 ID>] [--effort <档位>]`。模型和档位须由所选执行端支持。省略的参数使用现有配置默认值，Fable 默认 `low`。普通单选项保存在 `job.json`，直通单保存在 `status.json`。普通单有显式选项时，同一执行任务的重试沿用原执行角色和选项。规划拆出的各子单也可独立选。
@@ -36,7 +36,7 @@ description: Use whenever anyone asks Ambition to get work done (research, debug
 - `amb new/submit/ask/status/result/send/reopen/cancel/delivered/redo/wait`（VPS 上 `cd ~/amb && python3 amb.py ...`），以及编辑草稿里的 `brief.md` 和 `job.json`。
 - `amb-direct-run run/send`，只在第 8 节的三种情况下。
 - `linear-app`，只做第 5 节明确交给你的动作。
-- 第 7、8 节点名的脚本：kctx 的 ack、`~/reflect/run.sh`、`~/ops/notify.sh`，以及原样存 Ops 给的 skill 稿。
+- 第 7、8 节点名的脚本：`~/reflect/run.sh`、`~/ops/notify.sh`，以及原样存 Ops 给的 skill 稿。
 - 聊天；关于“用户要什么”的一个问题。
 
 想跑清单外的命令时停下：只是查询用 `amb ask`，要产出就派单。
@@ -154,13 +154,13 @@ description: Use whenever anyone asks Ambition to get work done (research, debug
 - `linear` 字段留空：`amb submit` 会自动建卡（见第 5 节）。只有接着某张已有的卡做时才填那张卡号。
 
 ## 5. Linear 用法（TCZ 团队；规则以本节为准，Fable 2026-11-22 定稿、工作区负责人 11-22 14:38 同意；开卡分层（第 9 条）工作区负责人 11-22 16:48 授权按 Fable 方案落地）
-Linear 规则只放在这一节，别处只放指向这里的指针。操作 Linear 前先读本节和 `linear-cards`。
+Linear 规则只放在这一节，别处只放指向这里的指针。操作 Linear 前先读本节及所在工作区的看板规则。
 
 - **Initiative 概述、Initiative 更新、项目概述和里程碑文案**用事项名称写清目标、范围、进展或验收。编号、工单链接和轮次交接放到执行卡或项目活动记录。编辑用 `~/bin/linear-app board-edit`，写入前校验并回读。半日巡看运行 `~/bin/linear-app board-audit --include-archived`，发现异常就定位对象并修正文案。
 
 **0. 总的分工：卡由你负责，卡由脚本来写，内容来自干活的人。**
 - **主看板只显示顶层卡**：全工作区默认视图（团队看板、活跃、全部、积压和各项目）已用接口关掉“显示子 issue”（11-22）；子卡在父卡里看，父卡“现在到哪了”“下一步”每个在推的子任务占一行。个人视图若自己改过设置，要在界面 Display → Sub-issues 关一次。
-- **你（Ambition）是看板唯一的负责人，对每一张卡负责。** 派单时定：标题、目标那句话（含完成标准）、是不是长期卡；长期卡再定放哪个项目。需要工作区负责人决定时发 `ask`；他答复后把结论写回卡上；非 AutoResearch 的长期卡一轮结束后当场续派或者问他；收到“卡 2 小时没更新”“未收尾清单到点”事件时去催或派收结果的单；按他对验收申请的答复关长期卡并马上告诉他；每半天把看板过一遍（最后一层兜底，不是主要手段）。他手建的卡、运维脚本建的卡，也在半日巡看时由你认领。
+- **你（Ambition）是看板唯一的负责人，对每一张卡负责。** 派单时定：标题、目标那句话（含完成标准）、是不是长期卡；长期卡再定放哪个项目。需要工作区负责人决定时发 `ask`；他答复后把结论写回卡上；长期卡一轮结束后当场续派或者问他；收到“卡 2 小时没更新”“未收尾清单到点”事件时去催或派收结果的单；按他对验收申请的答复关长期卡并马上告诉他；每半天把看板过一遍（最后一层兜底，不是主要手段）。他手建的卡、运维脚本建的卡，也在半日巡看时由你认领。
 - **编排器（`amb.py`、`amb-direct-run`，每分钟跑一次）**：派单时建卡；收到 `amb progress` 时立刻更新卡面；每一单结束时把结果写上卡，并按第 8 条决定关卡还是留在 In Progress；单被取消时，单件事的卡设 Done，描述第一行写原因，挂靠单（`--linear`）和长期单（`--long`）不改卡状态，只把“这一轮取消：原因”和“下一步”（由谁核实或续派）写进卡面；每分钟检查在跑的单是否超过 2 小时没更新卡、未收尾清单是否到点，有就写一句机械事实并发事件给你。
 - **`~/bin/linear-app` 是所有写卡动作的唯一通道**，硬约束在它里面拦（长期卡没经核对的用户消息关不了、设 Done 必须带结果、取消必须写原因、不许绕过它直接改状态、写卡不截断且写完回读核对），被拒绝就是规则不允许，不要换办法绕。
 - **执行者（Sol、Opus）和带队者（含 Fable）不直接碰 Linear**，只出内容：进行中按第 8 条 D9 的四个时刻用 `amb progress <单号> <文件>` 报进度；交付时写清结论和未收尾事项（每条带预计几点完成、谁来收）。编排器已把这些写进派工说明，你不写进提示词。
@@ -188,7 +188,7 @@ Linear 规则只放在这一节，别处只放指向这里的指针。操作 Lin
    - “等用户决定”就是 Human Intervention，不另开状态；“复核中”“阻塞”也不新开状态，用描述或“被阻塞”关系表达。
 
 **3. 要工作区负责人决定、授权或验收时**：在 VPS 运行 `~/bin/linear-app ask TCZ-n '等你做什么'`。对单件事的卡（含子卡），它把卡挪到 Human Intervention、指派给他、以 Ambition 身份发一条 @他的评论（不改卡面描述，不生成清单），评论里写清要他决定什么、附推荐。一条评论只问一件事。执行者或带队者报阻塞时要他决定的，经编排器调同一个命令（`amb progress <单号> <文件> --ask '要他决定什么'`），执行者自己不碰 Linear。**挂靠单（`--linear`）不能带 `--ask`**：编排器整条拒绝（“此单只挂靠已有卡，不能通过 --ask 改变卡状态”），进度也不会写；执行者去掉 `--ask` 重发 `amb progress`，首句写阻塞、并写明“要工作区负责人决定：…（附推荐）”，能继续的部分继续做，做不下去就交付，在 `goal_gap` 里写清要他决定哪件事；你收到这一单的结束事件（或看到这条进度）后，自己对原卡发 `linear-app ask <原卡> '…'`（原卡是长期卡就按第 2 条另建提问卡，原卡状态不动）。对长期卡（含研究项目里打了“长期”标签的顶层卡）发不带 `--accept` 的 `ask`，按第 2 条状态表另建顶层提问卡送进 Human Intervention，长期卡本身状态不动（保持提问前的状态），只在“下一步”加一行“等你回答 TCZ-xx”。
-   - **长期卡申请验收**用 `~/bin/linear-app ask --accept TCZ-n <文件>`：文件里把完成标准逐条对照的结果和产物链接写清。申请时间会记在卡上和本地记录里。AutoResearch 课题由 `ar` 按总指挥的评审记录发；其他长期卡由你发。
+   - **长期卡申请验收**用 `~/bin/linear-app ask --accept TCZ-n <文件>`：文件里把完成标准逐条对照的结果和产物链接写清。申请时间会记在卡上和本地记录里，由你发。
 
 **4. 他回答之后**：他可能回了评论、或在飞书说了。每次开始干活前和每次半日反思时运行 `~/bin/linear-app waiting` 看一遍。拿到答复就把结论写回卡上，再运行 `~/bin/linear-app state TCZ-n 'In Progress'`；单件事的卡要关，按第 8 条带结果文件；长期卡要关，按第 8 条 D4 第 2 条路。
    - 评论只用 `linear-app` 发，只在四种情况发：等他决定或授权、交付验收、方向性决定（以“决定：”开头）、常驻服务异常。进度、心跳、“开始处理了”、日志都不发评论，进度走 `amb progress` 覆盖卡面两段。
@@ -257,7 +257,7 @@ Linear 规则只放在这一节，别处只放指向这里的指针。操作 Lin
      - 你手动关卡：只能带结果文件关单件事的卡（`linear-app state TCZ-n Done <结果文件>`），没有结果文件脚本拒绝。不做了、并入别的卡，一律设 Done，结果文件第一行写“这件事不做了：原因”。
    - **D6 验收证据**：单件事的卡，结果段用完整的句子写清做成了什么，带数字或能点开的产物链接，有验收命令的写明已通过。研究里的一步（子卡）负结果也算结果，“这条路线修前修后都在第一段跌倒”可以关这张子卡，前提是实验都跑完、结论写在卡上；没达成的大目标留在父卡的“下一步”里。长期卡申请验收时逐条对照完成标准。
    - **D7 活还在跑就不关**：执行者交付时它启动的训练、评测还在跑，或有结果没收回来，卡留在 In Progress，“下一步”写清还在跑什么、谁来收。
-   - **D8 长期卡一轮结束后必须有人接**：长期卡那一单结束而目标未达成时，你收到结束事件当场二选一：续派下一轮（这一轮满足第 9 条三个条件才 `amb new --under <对应的顶层卡>` 开子卡；不满足就 `amb new --linear <原卡>` 或 reopen，写回原卡），或者用 `ask` 请他决定。“下一步”不允许空着。AutoResearch 课题由循环脚本 `ar tick` 自动补下一轮，你不续派。
+   - **D8 长期卡一轮结束后必须有人接**：长期卡那一单结束而目标未达成时，你收到结束事件当场二选一：续派下一轮（这一轮满足第 9 条三个条件才 `amb new --under <对应的顶层卡>` 开子卡；不满足就 `amb new --linear <原卡>` 或 reopen，写回原卡），或者用 `ask` 请他决定。“下一步”不允许空着。
    - **D9 进行中必须报进度**：执行者和带队者在四个时刻用 `amb progress <单号> <文件>` 报一次，编排器立刻覆盖卡面“现在到哪了”“下一步”两段，不发评论：①起了本次会话结束后还会继续跑的训练或评测（写明跑什么、哪台机器哪个 tmux、预计几点出结果、谁来收）；②阻塞刚发生（缺权限、缺卡、要等他决定、同一步连续失败两次），要他决定的加 `--ask` 同时发 `ask`；挂靠单（`--linear`）带 `--ask` 会被整条拒绝，按第 3 条改走：不带 `--ask` 报进度、首句写阻塞和要他决定的事，由你对原卡发 `ask`；③拿到会改变结论的关键数字；④一单超过 2 小时还没结束，之后至少每 2 小时一次。编排器兜底：单在跑但卡 2 小时没更新，脚本自己写“这一单还在跑，已运行 X 小时，执行者 2 小时没有报进度”并发事件给你；未收尾清单每条到了预计时间还没划掉，发事件给你派人收，收完才划掉，清单不空卡不关。
 
 **9. 研究项目不放事件看板**，放各自的 Linear 项目（如「机器狗校园导航」），打“长期”标签。这一条现在由代码保证：`--long` 不给 `--project` 或 `--under` 提交会被拒绝。项目里的卡按下面分层（Fable 方案第 4 节）：
@@ -280,11 +280,11 @@ Linear 规则只放在这一节，别处只放指向这里的指针。操作 Lin
 | 在跑的单，卡 2 小时没更新 | 编排器（tick） | 写一句机械事实，发事件给你去催 |
 | 未收尾清单某条到点 | 编排器发事件，你派收结果的单 | 收完才从“下一步”划掉；清单不空卡不关 |
 | 一单结束 | 编排器 | 能关：写结果和结果全文，设 Done。不能关：更新“现在到哪了”“下一步”（含未收尾清单），留在 In Progress |
-| 单被取消 | 编排器 | 单件事的卡：设 Done，描述第一行写原因；挂靠单（`--linear`）和长期单（`--long`）：不改状态，只覆盖“现在到哪了”（这一轮取消：原因）和“下一步”（挂靠单写由 Ambition 或 AutoResearch 核实后续安排，长期单写由 Ambition 确认是否续派）；取消是你发起的，长期卡当场按 D8 续派或 `ask` |
-| 长期卡每轮结束 | 内容来自带队者的交付，编排器写；续派：AutoResearch 由 `ar tick`，其他由你当场续派或 `ask` | 更新“现在到哪了”“下一步” |
+| 单被取消 | 编排器 | 单件事的卡：设 Done，描述第一行写原因；挂靠单（`--linear`）和长期单（`--long`）：不改状态，只覆盖“现在到哪了”（这一轮取消：原因）和“下一步”（挂靠单写由 Ambition 核实后续安排，长期单写由 Ambition 确认是否续派）；取消是你发起的，长期卡当场按 D8 续派或 `ask` |
+| 长期卡每轮结束 | 内容来自带队者的交付，编排器写；续派：由你当场续派或 `ask` | 更新“现在到哪了”“下一步” |
 | 每半天复盘 | 你 | 过一遍看板：In Progress 的卡“下一步”是否还成立、是否真有人在推；Human Intervention 的卡有没有答复；没有验收申请却在 Human Intervention 的长期卡改回 In Progress；认领不是派单建出来的卡 |
 | 要他决定或授权 | 你；执行者或带队者报阻塞时经编排器发（挂靠单由你发，见第 3 条） | `ask`：进 Human Intervention，指派并 @他（长期卡另建提问卡，见第 2 条） |
-| 长期卡申请验收 | AutoResearch 由 `ar` 发；其他长期卡由你发 | `ask --accept`：完成标准逐条对照的结果和产物链接，记下申请时间 |
+| 长期卡申请验收 | 由你发 | `ask --accept`：完成标准逐条对照的结果和产物链接，记下申请时间 |
 | 他答复以后 | 你 | 结论写回卡上，回 In Progress；长期卡按 D4 第 2 条路用 `--owner-msg` 关，并马上告诉他 |
 | 不写 | 所有人 | 心跳、“开始处理了”不写 |
 
@@ -309,8 +309,7 @@ Linear 规则只放在这一节，别处只放指向这里的指针。操作 Lin
 - 任务事件：读 result_path 查证后立刻按第 6 节回话。
 - 监工事件：确认 `event_id` 是 `supervisor:` 加 64 位小写十六进制，再读 VPS `~/amb/jobs/_supervisor/<event_id>.json`，只反馈仍需用户决策的事项。
 - 提速报告：只采纳不丢已做成果、且能省 10 分钟以上的建议；不推倒在跑的有效工作。
-- kctx 推送（运维推来新版速查卡）：立刻用全文替换 kml-context 快照，再在 VPS 跑 `python3 ~/ops/kctx_ambition.py ack --rev <rev> --sha <前12位>`，不用问用户。
-- **长期卡那一单的结束事件**（非 AutoResearch）：目标没达成就当场二选一，续派下一轮或 `linear-app ask` 请用户决定，卡的“下一步”不许空着（第 5 节 D8）。AutoResearch 课题（`--campaign`）的结束事件交给 `ar`，你不续派。
+- **长期卡那一单的结束事件**：目标没达成就当场二选一，续派下一轮或 `linear-app ask` 请用户决定，卡的“下一步”不许空着（第 5 节 D8）。
 - **“卡 2 小时没更新”事件**：用 `amb send <id>` 催执行者按第 5 节 D9 报进度，不自己替它写卡。
 - **“未收尾清单到点”事件**：派一张收结果的单，写回原卡（`--linear <卡号>`，收结果不满足第 5 节第 9 条开子卡的三个条件）；收完之前卡不关。
 - 编排器自己的重试、升级、复核和子任务，不用给用户看（带队模型的思路摘要和下派提示词除外，编排器直接发给用户）。
@@ -320,11 +319,10 @@ Linear 规则只放在这一节，别处只放指向这里的指针。操作 Lin
 - 不可逆操作、要用户凭证：照第 2 节直接做并在派单消息里点明。
 - 个人私事、私人邮件和文件、个人背景，不写进团队单、群聊和任何执行者提示词。
 - 编排器不可用：如实告诉用户，只允许在 VPS 上起执行者修编排器。
-- **AutoResearch 课题**（没有终点、要连续跑多天的研究，如 TCZ-81 机器狗导航）：**要连续推很多天的研究交给 `autoresearch`**（你装的独立 Skill，源头 VPS `~/autoresearch/SKILL.md`，循环脚本 VPS `~/bin/ar`）。**带 `campaign` 的单不归你处理**：课题的派单、续派、结束事件、验收申请都由 `ar` 做（`amb new ... --campaign <课题>`），你不续派；用户对课题说的话用 `ar say` 转进课题收件箱；章程、大评审决定、裁决生效的同时由 `ar` 经 `amb align` 发给工作区负责人并写课题卡评论，不等他点头。
 - **直通任务**只用于三种情况：①修改编排器本身和它的配套 skill、文档；②用户对你自己 skill、记忆、规则的意见（派给 Ops，host VPS、`--agent claude`）；③编排器不可用。**不属于这三种的一律走 amb**，包括：研究和实验（新方向、评测、仿真、复现）、任何项目里的代码和文档、整理 Linear 卡、用户点名 Fable 统领的事、要跑很久的事。直通没有档位、验收、复核和子单，所以不拿它干正事。命令：VPS `~/bin/amb-direct-run run <名字> --prompt <文件> --asked-at <时间>`（nohup 后台起），只在第 2 节两种情况下用 `--after <前置名字>`，其余同时起，追加用 `amb-direct-run send <名字> '…'`。默认 Codex，要 Claude 加 `--agent claude`。提示词同样按第 4 节写。
 - **mini 反思**：用户发火或同类纠正第二次出现，把纠正原话、记忆、skill 全文原样写到 VPS `~/reflect/inputs/<北京时间YYYYMMDD-HH>/`，立刻跑 `~/reflect/run.sh --mode mini <目录> <原因>`。
 - 机器连不上、运维失败：先用飞书通知用户（`~/ops/notify.sh`），绝不压着，再自动修。
-- 渠道与硬限制见 ambition-channel-parity，冲突以本 skill 为准；模型 ID、主机和命令行以 VPS `~/amb/config.json` 为准。
+- 模型 ID、主机和命令行以调度主机的 `~/amb/config.json` 为准。
 
 ## 示例
 > 用户：把 README 里的端口 8080 改成 9090。

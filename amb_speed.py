@@ -66,7 +66,7 @@ def amb_metadata(amb, cfg, now):
         for stage, minutes, begin, ended in stages:
             if begin >= day and ended:
                 completed.setdefault(stage, []).append(minutes)
-        if states[jid] in amb.TERMINAL or job.get("campaign"):
+        if states[jid] in amb.TERMINAL:
             continue
         attempt = st.get("attempt", 0)
         models = (st.get("attempts") or {}).get(str(attempt)) or {}
@@ -256,7 +256,6 @@ def schedule(amb, cfg):
     direct = direct_metadata(amb, direct_root, work, now, sample=True)
     active = direct or any(
         (amb.read_json(amb.jobs_dir(jid, "state.json"), {}) or {}).get("state") not in (*amb.TERMINAL, None)
-        and not (amb.read_json(amb.jobs_dir(jid, "job.json"), {}) or {}).get("campaign")
         for jid in amb.list_jobs()
     )
     state = amb.read_json(work / "run.json", {}) or {}
@@ -301,11 +300,7 @@ def forward_pending(amb, cfg, path, seen):
             continue
         try:
             entry = record["entry"]
-            job = amb.read_json(amb.jobs_dir(entry["task"], "job.json"), {}) or {}
-            if job.get("campaign"):
-                amb.campaign_alert(cfg, job, entry["event_id"], entry["reason"])
-            else:
-                amb_sentinel.append_outbox(amb, cfg, entry)
+            amb_sentinel.append_outbox(amb, cfg, entry)
         except (amb.HostDown, amb.StepError, OSError, ValueError):
             break  # durable queue, retry on next tick without repeating the model
         record["pending"] = False

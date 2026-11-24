@@ -120,8 +120,6 @@ def record(root, jid, job, phase, clock, since, reason, action="needs_decision")
     }
     if job.get("test") is True:
         event["test"] = True
-    if job.get("campaign"):
-        event["campaign"] = job["campaign"]
     write_json(path, event)
 
 
@@ -192,6 +190,6 @@ def recent_events(root, since=0):
     events = []
     for path in Path(root, "jobs", "_sentinel", "events").glob("*/*.json"):
         event = read_json(path)
-        if isinstance(event, dict) and not event.get("campaign") and (timestamp(event.get("ts")) or 0) >= since:
+        if isinstance(event, dict) and (timestamp(event.get("ts")) or 0) >= since:
             events.append(event)
     return sorted(events, key=lambda event: (event["ts"], event["event_id"]))

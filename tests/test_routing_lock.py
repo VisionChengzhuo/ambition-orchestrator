@@ -21,7 +21,7 @@ class RoutingLock(unittest.TestCase):
         self.assertNotIn("fable", amb.DEFAULT_PLANNER)
         self.assertFalse(fable(CONFIG.get("planner") or amb.DEFAULT_PLANNER))
         for start, rungs in CONFIG["ladder"].items():
-            if start == "fable":  # 只有显式 amb new --exec fable 才走这一档（AutoResearch 总指挥），不是默认
+            if start == "fable":  # 只有显式 amb new --exec fable 才走这一档，不是默认
                 continue
             for rung in [start, *rungs]:
                 if rung != "replan":

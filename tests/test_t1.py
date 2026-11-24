@@ -153,7 +153,7 @@ class TestT1CLI(unittest.TestCase):
         jid = self.amb("new", "--once", "--kind", "doc", "--tier", "L1", "--exec", "opus").stdout.strip()
         job = json.loads((self.jobs / "_draft" / jid / "job.json").read_text())
         self.assertEqual(job["exec"], "opus")
-        # autoresearch_design A1：AutoResearch 总指挥要能显式派 Fable 单（默认仍不是 Fable）
+        # 调用方要能显式派 Fable 单（默认仍不是 Fable）
         jid = self.amb("new", "--once", "--kind", "doc", "--exec", "fable").stdout.strip()
         self.assertEqual(json.loads((self.jobs / "_draft" / jid / "job.json").read_text())["exec"], "fable")
         self.amb("new", "--exec", "astra", expected=2)

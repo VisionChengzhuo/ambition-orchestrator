@@ -56,8 +56,6 @@ ATTACH_PROGRESS_INSTRUCTIONS = PROGRESS_INSTRUCTIONS.replace(
 
 
 def progress_instructions(job):
-    if job.get("campaign"):
-        return "课题单将阶段进度和阻塞写入课题账本及事件日志。课题卡由 AutoResearch 统一更新。"
     return ATTACH_PROGRESS_INSTRUCTIONS if job.get("linear_attach") else PROGRESS_INSTRUCTIONS
 DISPATCH_START_LIMIT_S = 120
 
@@ -1232,8 +1230,6 @@ def validate(job, cfg):
             raise AmbError("deadline 已过")
     except (KeyError, ValueError, TypeError):
         raise AmbError("deadline 缺失或格式错误")
-    if job.get("campaign") and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", str(job["campaign"])):
-        raise AmbError("campaign 名称无效")
     if job.get("long") and not (job.get("linear_project") or job.get("linear_parent") or job.get("linear_attach")):
         raise AmbError("长期任务须指定 Linear 项目或父卡")
     kind = job.get("kind", "code")
@@ -1703,7 +1699,7 @@ def exec_prompt(job, st, cfg, host, repo, wt, inbox=None):
               '"goal_met": true, "goal_gap": "", "needs_plan": false}']
     if inbox and not leader:
         lines += ["", inbox_instructions(inbox, host).rstrip()]
-    if job.get("linear") and not job.get("campaign"):
+    if job.get("linear"):
         lines += ["", "写卡摘要最多 400 字，可直接关卡的结果最多 600 字。下一步最多 10 条，每条最多 100 字。"]
     if not leader and st.get("speed_hint", amb_speed.speed_hint_enabled()):
         lines += ["", amb_speed.SPEED_HINT]
@@ -1853,8 +1849,6 @@ def start_attempt(jid, job, st, cfg):
     prompt = exec_prompt(job, st, cfg, host, repo, wt, inbox=d)
     if job.get("plan_attempt") and job.get("dispatch_thinking"):
         parent, _ = load(job["parent"])
-        if job.get("campaign"):
-            parent = {**parent, "campaign": job["campaign"]}
         queue_dispatch_alignment(parent, cfg, jid, job["title"], job["dispatch_thinking"],
                                  "执行提示词", prompt, key=[jid, st["attempt"]])
     atomic_write(att_dir(jid, st, "exec", "prompt.md"), prompt)
@@ -1867,7 +1861,7 @@ def start_attempt(jid, job, st, cfg):
     timeout = model_step_timeout(job, cfg, leader=leader)
     start_step(jid, job, st, cfg, host, "exec", argv, wt, timeout,
                stdin=f"{d}/prompt.md", stepdir=d, inbox=True, structured_open_items=True,
-               card_limits=bool(job.get("linear") and not job.get("campaign")))
+               card_limits=bool(job.get("linear")))
 
 
 def cand(st):
@@ -1985,7 +1979,7 @@ def start_repair(jid, job, st, cfg, host, findings):
     tr(st, "exec", f"同轮修复 {cand(st)}")
     start_step(jid, job, st, cfg, host, "repair", argv, st["wt"], model_step_timeout(job, cfg),
                stdin=f"{d}/prompt.md", stepdir=d, sha=cand(st), inbox=True, structured_open_items=True,
-               card_limits=bool(job.get("linear") and not job.get("campaign")))
+               card_limits=bool(job.get("linear")))
 
 
 def reset_plan_state(st):
@@ -2208,8 +2202,6 @@ def make_subs(jid, job, st, plan, *, streaming=False):
                "depends_on": deps, "plan_attempt": st["attempt"]}
         sub.update(exec_overrides(s))
         inherit_test_mode(sub)
-        if job.get("campaign"):
-            sub["campaign"] = job["campaign"]
         if streaming:
             sub["dispatch_thinking"] = plan["thinking"]
         os.makedirs(jobs_dir(cid), exist_ok=True)
@@ -3022,7 +3014,6 @@ def poll_step(jid, job, st, cfg):
                                    and next(active_delegations(job), None) is not None)
             amb_sentinel.observe_run(root(), jid, job, run, p, legacy_progress,
                                      waiting_on_children=waiting_on_children)
-            route_campaign_sentinel(cfg, job, ("plan", "exec", "review"))
         return
     # 进程与 exit 都不在：基础设施重启，不加 attempt，最多 2 次。
     st["infra_restarts"] = st.get("infra_restarts", 0) + 1
@@ -3089,7 +3080,6 @@ def tick_job(jid, cfg):
     job, st = load(jid)
     if cfg.get("sentinel") is True:
         amb_sentinel.observe_state(root(), jid, job, st)
-        route_campaign_sentinel(cfg, job, ("queue", "human"))
     if st["state"] in TERMINAL:
         return
     before = json.dumps(st, sort_keys=True)
@@ -3153,7 +3143,7 @@ def finalize(jid, job, st, cfg):
                   "merged": res["merged"], "started": timing["dispatched_at"],
                   "attempts": st.get("attempts"), "last_sig": st.get("last_sig"), "rework": res["rework"],
                   **({"execution_breakdown": breakdown} if breakdown else {})})
-    if not job.get("parent") and (not job.get("lead_parent") or job.get("campaign")):
+    if not job.get("parent") and not job.get("lead_parent"):
         webhook_send(jid, job, st, cfg, result_path, res["summary"])
     if job.get("lead_parent"):
         report_to_leader(jid, job, st, cfg)
@@ -3227,7 +3217,7 @@ def notify(jid, cfg):
     if n.get("linear") != s:
         channels.append(("linear", lambda until: linear_update(jid, job, st, cfg, until)))
     if (s in NOTIFY_STATES and not reply_to_requester
-            and not (job.get("parent") or job.get("lead_parent") or job.get("campaign"))):
+            and not (job.get("parent") or job.get("lead_parent"))):
         fs = cfg.get("feishu") or {}
         if n.get("feishu") != s and fs.get("enabled") and fs.get("cmd"):
             channels.append(("feishu", lambda until: feishu_send(jid, st, fs, until)))
@@ -3242,16 +3232,11 @@ def notify(jid, cfg):
 
 
 def has_requester_route(job):
-    return bool(job.get("feishu_request_id") and not (job.get("parent") or job.get("campaign")))
+    return bool(job.get("feishu_request_id") and not job.get("parent"))
 
 
 def webhook_send(jid, job, st, cfg, result_path, summary):
     if job.get("test") is True and not job.get("linear"):
-        return
-    if job.get("campaign"):
-        # AutoResearch 派的单：结束事件交给课题的循环脚本（ar tick 读），不叫醒 Ambition
-        append_jsonl(campaign_events_path(cfg, job["campaign"]),
-                     {"ts": now(), "id": jid, "state": st["state"], "summary": summary, "result": result_path})
         return
     if has_requester_route(job):
         return
@@ -3259,12 +3244,6 @@ def webhook_send(jid, job, st, cfg, result_path, summary):
     if since and parse_time(st["history"][-1]["ts"]) < parse_time(since):
         return
     amb_events.emit(root(), jid, job.get("title") or jid, st["state"], summary, result_path)
-
-
-def campaign_events_path(cfg, name):
-    base = os.path.expanduser(cfg.get("autoresearch_root") or os.environ.get("AR_ROOT") or "~/autoresearch/campaigns")
-    os.makedirs(os.path.join(base, name), exist_ok=True)
-    return os.path.join(base, name, "amb_events.jsonl")
 
 
 def wake_job_events(cfg):
@@ -3298,10 +3277,10 @@ def forward_supervisor(cfg):
     except (HostDown, StepError, OSError) as exc:
         append_jsonl(os.path.join(root(), "stats.jsonl"),
                      {"ts": now(), "event": "supervisor_pull_failed", "error": type(exc).__name__})
-    forward_outbox(lines, sc, cfg.get("webhook") or {}, cfg=cfg)
+    forward_outbox(lines, sc, cfg.get("webhook") or {})
 
 
-def forward_outbox(lines, sc, wh, cfg=None):
+def forward_outbox(lines, sc, wh):
     ledger_path = jobs_dir("_supervisor", "receipts.json")
     ledger = read_json(ledger_path, {})
     saved_count = len(ledger)
@@ -3333,11 +3312,6 @@ def forward_outbox(lines, sc, wh, cfg=None):
             json.dumps(identity, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         if event_id in ledger:
             continue
-        if cfg is not None and outcome == "pending" and re.fullmatch(r"J-[A-Za-z0-9._-]+", task):
-            job = read_json(jobs_dir(task, "job.json"), {}) or {}
-            if job.get("campaign"):
-                campaign_alert(cfg, job, event_id, str(entry.get("reason") or action))
-                outcome = "campaign"
         if outcome == "pending":
             write_json(jobs_dir("_supervisor", event_id + ".json"), entry, mode=0o600)
         ledger[event_id] = {"outcome": outcome, "task": task, "source_ts": entry["ts"], "ts": now()}
@@ -3427,7 +3401,7 @@ def queue_alignment(job, cfg, title, body, *, key=None, dispatch=None):
     if job.get("test") is True or (cfg or {}).get("review_events", True) is False:
         return
     fs = cfg.get("feishu") or {}
-    card = "" if job.get("campaign") else card_ref(job.get("linear") or job.get("parent") or job.get("lead_parent"))
+    card = card_ref(job.get("linear") or job.get("parent") or job.get("lead_parent"))
     if (cfg.get("linear") or {}).get("dry_run", True):
         card = ""
     if not (fs.get("cmd") and fs.get("alignment_enabled", True)) and not card:
@@ -3536,8 +3510,6 @@ def linear_block(jid, st):
 
 
 def linear_update(jid, job, st, cfg, deadline):
-    if job.get("campaign"):
-        return True
     lc = cfg.get("linear") or {}
     if lc.get("dry_run", True) or not job.get("linear"):
         key_file = os.path.expanduser(lc.get("api_key_file") or "")
@@ -3650,7 +3622,7 @@ def linear_auto_card(job, brief, cfg):
     """顶层非 ask 单派出时自动在事件看板建卡（In Progress）；重开沿用原卡并挪回 In Progress。
     建新卡时目标必填（J-1122-02 linear_plan 6.2：标题、目标、是否长期、项目由 Ambition 派单时定，不填拒绝提交）。"""
     lc = cfg.get("linear") or {}
-    if (job.get("campaign") or not lc.get("auto_create") or lc.get("dry_run", True) or job.get("parent")
+    if (not lc.get("auto_create") or lc.get("dry_run", True) or job.get("parent")
             or job.get("test") is True or job.get("kind") == "ask"):
         return
     if job.get("linear"):
@@ -3778,13 +3750,11 @@ def card_progress_text(job, st):
             nxt.append("目标已达成，自动申请验收没成功，由 Ambition 对照完成标准和产物后申请验收。"
                        if st.get("acceptance_request") == "failed" else
                        "由 Ambition 对照完成标准和产物后申请验收。")
-        elif job.get("campaign"):
-            nxt.append("由 AutoResearch 循环安排下一轮。")
         else:
             nxt.append("本轮结束，由 Ambition 续派下一轮或请童成卓决定。")
     nxt.extend(open_item_text(item) for item in st.get("delegated_open_items") or [])
     if not nxt:
-        nxt.append("由 AutoResearch 循环安排下一轮。" if job.get("campaign") else "由 Ambition 核实后续安排。")
+        nxt.append("由 Ambition 核实后续安排。")
     return "## 现在到哪了\n" + now_part + "\n\n## 下一步\n" + "\n".join("- " + x for x in card_next_items(nxt)) + "\n"
 
 
@@ -3804,35 +3774,13 @@ def record_open_items(job, st, activity):
             activity["pending"].setdefault(key, {"item": item, "job": job["id"]})
 
 
-def campaign_alert(cfg, job, key, summary):
-    receipt = hashlib.sha256(key.encode()).hexdigest()
-    path = jobs_dir(job["id"], "campaign-alerts", receipt + ".json")
-    if not os.path.exists(path):
-        event = {"ts": now(), "id": job["id"], "state": "alert", "event_id": key, "summary": summary}
-        append_jsonl(campaign_events_path(cfg, job["campaign"]), event)
-        write_json(path, event)
-
-
-def route_campaign_sentinel(cfg, job, phases):
-    if job.get("campaign"):
-        for phase in phases:
-            event = read_json(amb_sentinel.event_path(root(), job["id"], phase))
-            if event:
-                campaign_alert(cfg, job, event["event_id"], event["reason"])
-
-
-def card_event(job, key, summary, cfg):
+def card_event(job, key, summary):
     path = jobs_dir(job["id"], f"linear-notice-{key}.md")
     atomic_write(path, summary + "\n")
-    if job.get("campaign"):
-        campaign_alert(cfg, job, f"linear:{job['id']}:{key}", summary)
-    else:
-        amb_events.emit(root(), job["id"], job.get("title") or job["id"], "blocked", summary, path)
+    amb_events.emit(root(), job["id"], job.get("title") or job["id"], "blocked", summary, path)
 
 
 def maintain_card(job, st, cfg):
-    if job.get("campaign"):
-        return
     card = card_ref(job.get("linear"))
     if not card or (cfg.get("linear") or {}).get("dry_run", True):
         return
@@ -3847,7 +3795,7 @@ def maintain_card(job, st, cfg):
         result = linear_app(cfg, "audit", card)
         activity["last_audit"] = clock
         if result and result.startswith("reopened "):
-            card_event(job, f"audit-{int(clock)}", f"{card} 处于没有授权的状态，已恢复为 In Progress。", cfg)
+            card_event(job, f"audit-{int(clock)}", f"{card} 处于没有授权的状态，已恢复为 In Progress。")
         write_json(path, activity)
     if st["state"] in TERMINAL:
         for key, pending in activity["pending"].items():
@@ -3857,7 +3805,7 @@ def maintain_card(job, st, cfg):
             if not isinstance(item, dict) or not item.get("eta"):
                 continue
             if parse_time(item["eta"]).timestamp() <= clock:
-                card_event(job, key, f"{card} 未收尾事项到点（{key}）：{open_item_text(item)}", cfg)
+                card_event(job, key, f"{card} 未收尾事项到点（{key}）：{open_item_text(item)}")
                 pending["notified"] = True
                 write_json(path, activity)
         return
@@ -3881,7 +3829,7 @@ def maintain_card(job, st, cfg):
         if (not result.startswith(("fresh ", "inactive "))
                 and clock - activity.get("stale_notice", 0) >= LINEAR_PROGRESS_INTERVAL):
             bucket = int(clock // LINEAR_PROGRESS_INTERVAL)
-            card_event(job, f"stale-{bucket}", f"{card} {message}", cfg)
+            card_event(job, f"stale-{bucket}", f"{card} {message}")
             activity["stale_notice"] = clock
     activity["stale_attempt"] = clock
     write_json(path, activity)
@@ -3897,7 +3845,7 @@ def append_pending(text, activity):
 
 
 def cmd_align(a, cfg):
-    """AutoResearch 等不在 amb 单里的带队方，把章程、评审决定、裁决在生效同时发给用户（飞书 + 卡评论），不等确认。"""
+    """外部带队方，把章程、评审决定、裁决在生效同时发给用户（飞书 + 卡评论），不等确认。"""
     body = read_text(a.file).strip()
     if not body:
         raise AmbError("对齐内容为空", 2)
@@ -3926,8 +3874,6 @@ def cmd_progress(a, cfg):
     with open(os.path.join(root(), ".tick.lock"), "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         job, _ = load(a.id)
-        if job.get("campaign"):
-            raise AmbError("课题子单请通过 AutoResearch 汇报进度")
         card = card_ref(job.get("linear"))
         if a.ask and job.get("linear_attach"):
             raise AmbError("此单只挂靠已有卡，不能通过 --ask 改变卡状态")
@@ -4019,7 +3965,7 @@ def request_acceptance(job, st, cfg):
 def linear_sync_state(job, st, cfg):
     """单结束时写卡：取消的单件事和可关的卡设 Done；其余只更新“现在到哪了/下一步”，卡留在 In Progress。
     长期卡目标达成且没有未收尾的活时送 Human Intervention 请童成卓验收（只有他能关）。挂靠卡（linear_attach）从不改状态。"""
-    if job.get("campaign") or not (job.get("linear") and (job.get("linear_auto") or job.get("linear_attach"))):
+    if not (job.get("linear") and (job.get("linear_auto") or job.get("linear_attach"))):
         return
     if st["state"] not in ("done", "cancelled"):
         return
@@ -4099,7 +4045,7 @@ def inherit_test_mode(job):
 
 
 def create_draft(a, jid=None):
-    if not any(getattr(a, key, None) for key in ("long", "once", "linear", "lead", "under", "campaign")):
+    if not any(getattr(a, key, None) for key in ("long", "once", "linear", "lead", "under")):
         raise AmbError("新建卡须明确给 --long 或 --once")
     jid = jid or new_id()
     job = skeleton(jid, a.kind, a.tier or "L1", a.host, a.repo or "")  # 不写档位一律 L1：L2/L3 必复核，要复核须明说
@@ -4115,14 +4061,12 @@ def create_draft(a, jid=None):
     if getattr(a, "lead", None):
         if a.lead not in list_jobs():
             raise AmbError(f"找不到带队父单 {a.lead}", 3)
-        parent, state = load(a.lead)
+        _, state = load(a.lead)
         if state["state"] in TERMINAL:
             raise AmbError(f"带队父单 {a.lead} 已结束")
         job["lead_parent"] = a.lead
         if card := card_ref(a.lead):
             job["linear_parent"] = card
-        if parent.get("campaign"):
-            job["campaign"] = parent["campaign"]
     if getattr(a, "long", False):
         if not (getattr(a, "project", None) or getattr(a, "under", None)):
             raise AmbError("--long 必须同时给 --project <Linear 项目名> 或 --under <卡号>：长期卡不落在事件看板", 2)
@@ -4133,8 +4077,6 @@ def create_draft(a, jid=None):
         job["goal"] = a.goal.strip()
     if getattr(a, "linear", None):  # 只挂到已有的卡：不新建卡，结束时只回写进展，从不改它的状态
         job.update(linear=a.linear, linear_attach=True, linear_auto=False)
-    if getattr(a, "campaign", None):
-        job["campaign"] = a.campaign
     inherit_test_mode(job)
     write_json(jobs_dir("_draft", jid, "job.json"), job)
     atomic_write(jobs_dir("_draft", jid, "brief.md"), "# 标题\n\n## 目标\n\n## 背景与假设\n\n## 交付物\n")
@@ -4158,8 +4100,6 @@ def submit_job(job, brief, cfg, src=None, *, route_bound=False):
         job["dispatch_thinking"] = thinking_text(job.get("dispatch_thinking"))
         if parent_card := card_ref(leader["id"]):
             job["linear_parent"] = parent_card
-        if leader.get("campaign"):
-            job["campaign"] = leader["campaign"]
     inherit_test_mode(job)
     if not route_bound:
         bind_feishu_job(job, cfg)
@@ -4188,8 +4128,7 @@ def submit_job(job, brief, cfg, src=None, *, route_bound=False):
     record_timing(job, state, "timing_dispatched")
     if job.get("lead_parent"):
         atomic_write(jobs_dir(job["lead_parent"], "led", jid), "")
-        dispatch_source = {**leader, "campaign": job["campaign"]} if job.get("campaign") else leader
-        queue_dispatch_alignment(dispatch_source, cfg, jid, job["title"], job["dispatch_thinking"],
+        queue_dispatch_alignment(leader, cfg, jid, job["title"], job["dispatch_thinking"],
                                  "派单提示词", brief, key=jid)
     try:
         subprocess.Popen(amb_argv("_watch-dispatch-start", jid), start_new_session=True, close_fds=True,
@@ -4861,8 +4800,7 @@ def main(argv=None):
     card_type.add_argument("--once", action="store_true", help="单件事卡")
     n.add_argument("--project", help="Linear 项目名；--long 时必须给它或 --under")
     n.add_argument("--goal", help="卡面“目标”一句话（谁、对什么、做什么、为了什么）含完成标准；建卡的单必填，也可写在 brief 的 ## 目标 段")
-    n.add_argument("--linear", help="只挂到已有的卡 TCZ-n；课题子单仅关联卡号")
-    n.add_argument("--campaign", help="AutoResearch 课题名：结束事件交给 ar，不推给 Ambition")
+    n.add_argument("--linear", help="只挂到已有的卡 TCZ-n")
     n.add_argument("--lead", help="带队父单号，子单结果汇总到父单")
     n.add_argument("--leader", action="store_true", help="开带队单：在 VPS 或开发机使用 Claude 协调工具拆活派单")
     submit = sub.add_parser("submit")

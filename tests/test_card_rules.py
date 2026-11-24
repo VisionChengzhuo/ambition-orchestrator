@@ -65,15 +65,15 @@ class AmbCardRules(unittest.TestCase):
 
     def test_new_flags(self):
         a = SimpleNamespace(kind="doc", tier=None, host="local", repo=None, exec="fable", asked_at=None,
-                            under=None, long=True, project=None, linear=None, campaign=None)
+                            under=None, long=True, project=None, linear=None)
         with mock.patch.object(amb, "new_id", return_value="J-T"), mock.patch.object(amb, "append_jsonl"):
             with self.assertRaises(amb.AmbError):
                 amb.create_draft(a)
-            a.project, a.campaign, a.linear = "机器狗校园导航", "pku-nav", "TCZ-81"
+            a.project, a.linear = "示例项目", "TCZ-81"
             amb.create_draft(a)
         job = json.loads(Path(self.tmp.name, "_draft", "J-T", "job.json").read_text(encoding="utf-8"))
-        self.assertEqual((job["exec"], job["long"], job["linear_project"], job["campaign"]),
-                         ("fable", True, "机器狗校园导航", "pku-nav"))
+        self.assertEqual((job["exec"], job["long"], job["linear_project"]),
+                         ("fable", True, "示例项目"))
         self.assertEqual((job["linear"], job["linear_attach"], job["linear_auto"]), ("TCZ-81", True, False))
 
     LIVE = {"linear": {"auto_create": True, "dry_run": False}}
@@ -108,7 +108,7 @@ class AmbCardRules(unittest.TestCase):
 
     def test_new_stores_goal(self):
         a = SimpleNamespace(kind="doc", tier=None, host="local", repo=None, exec="opus", asked_at=None,
-                            under=None, long=False, project=None, linear=None, campaign=None,
+                            under=None, long=False, project=None, linear=None,
                             once=True, goal="  修好看板。完成标准：卡面不截断  ")
         with mock.patch.object(amb, "new_id", return_value="J-T"), mock.patch.object(amb, "append_jsonl"):
             amb.create_draft(a)
@@ -116,7 +116,7 @@ class AmbCardRules(unittest.TestCase):
         self.assertEqual(job["goal"], "修好看板。完成标准：卡面不截断")
 
     def test_align_queues_owner_review_without_waiting(self):
-        """与人类对齐：AutoResearch 的章程/评审决定经 amb align 同时发飞书并写卡评论。"""
+        """与人类对齐：外部带队方的章程/评审决定经 amb align 同时发飞书并写卡评论。"""
         body = Path(self.tmp.name, "charter.md")
         body.write_text("三队方向：A、B、C。\n", encoding="utf-8")
         cfg = {"feishu": {"cmd": "true"}, "linear": {"dry_run": False}}
@@ -236,26 +236,6 @@ class AmbCardRules(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-def test_campaign_skips_all_automatic_card_entry_points(tmp_path, monkeypatch):
-    import pytest
-    monkeypatch.setenv("AMB_ROOT", str(tmp_path))
-    job = {"id": "J-test", "campaign": "test", "linear": "TCZ-81", "linear_auto": True, "long": True}
-    cfg = {"linear": {"auto_create": True, "dry_run": False}}
-    st = {"state": "cancelled"}
-    with mock.patch.object(amb, "linear_app") as app, mock.patch.object(amb, "load", return_value=(job, st)):
-        amb.linear_auto_card({**job, "linear": ""}, "", cfg)
-        amb.maintain_card(job, st, cfg)
-        assert amb.linear_update(job["id"], job, st, cfg, 0) is True
-        assert amb.linear_sync_state(job, st, cfg) is None
-        with pytest.raises(amb.AmbError, match="AutoResearch"):
-            amb.cmd_progress(SimpleNamespace(id=job["id"]), cfg)
-        with mock.patch.object(amb, "launch_background"):
-            amb.queue_alignment(job, {**cfg, "feishu": {"cmd": "mock"}}, "标题", "内容")
-        pending = next(tmp_path.glob("jobs/_alignment/pending/*.json"))
-        assert json.loads(pending.read_text())["card"] == ""
-        app.assert_not_called()
 
 
 def test_progress_limits_return_oversize_content_to_author():
