@@ -1,0 +1,1875 @@
+#!/usr/bin/env python3
+"""以 Linear 应用身份 Ambition 读写 TCZ 工作区。用 --help 查看子命令。"""
+import argparse
+from bisect import bisect_right
+import base64
+from datetime import datetime, timedelta, timezone
+import fcntl
+import hashlib
+from html import unescape
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import tempfile
+import time
+from unicodedata import category
+import urllib.parse
+import urllib.request
+
+from markdown_it import MarkdownIt
+
+# Share report parsing with the orchestrator installed alongside this CLI.
+AMB_MODULES = Path(__file__).resolve().parent
+if not (AMB_MODULES / "card_text.py").is_file():
+    AMB_MODULES = Path.home() / "amb"
+sys.path.insert(0, str(AMB_MODULES))
+from card_text import split_summary_message
+
+D = os.path.expanduser("<REDACTED_PATH>")
+CLIENT, TOKEN = D + "/ambition-app-client.json", D + "/ambition-app-token.json"
+API = "https://api.linear.app/graphql"
+OWNER = {"id": "<REDACTED_ID>", "url": "<REDACTED_URL>"}
+STATES = {"Todo": "<REDACTED_ID>", "In Progress": "<REDACTED_ID>",
+          "Human Intervention": "<REDACTED_ID>", "常驻": "<REDACTED_ID>",
+          "Done": "<REDACTED_ID>", "Canceled": "<REDACTED_ID>"}
+# 做完用 Done，不再做或并入别卡用 Canceled。
+TEAM = "<REDACTED_ID>"
+PROJECT = "<REDACTED_ID>"  # Ambition 事件看板（试验）
+
+def token(rejected=None):
+    with open(TOKEN + ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return cached_token(rejected)
+
+
+def cached_token(rejected):
+    try:
+        with open(TOKEN) as f:
+            t = json.load(f)
+            expires_at = os.fstat(f.fileno()).st_mtime + int(t.get("expires_in", 0))
+    except FileNotFoundError:
+        t, expires_at = {}, 0
+    if expires_at - time.time() < 300 or t.get("access_token") == rejected:
+        c = json.load(open(CLIENT))
+        basic = base64.b64encode(f"{c['client_id']}:{c['client_secret']}".encode()).decode()
+        req = urllib.request.Request("https://api.linear.app/oauth/token",
+                                     data=urllib.parse.urlencode({"grant_type": "client_credentials", "scope": "read,write,app:mentionable"}).encode(),
+                                     headers={"<REDACTED_AUTH_HEADER>": "Basic " + basic, "Content-Type": "application/x-www-form-urlencoded"})
+        t = json.loads(urllib.request.urlopen(req, timeout=30).read())
+        tmp = TOKEN + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(t, f)
+        os.replace(tmp, TOKEN)
+    return t["access_token"]
+
+JOB_ID = re.compile(r"(?<![\w/~.-])J-\d{4}-\w+(?:/\w+)*")
+
+URL_PUNCTUATION = re.compile(r'(https?://[^\s<>()\[\]`"。，；：）】》]+)([。，；：）】》])')
+
+
+def humanize(x, *, jobs=True):
+    """卡面和评论是给人看的：编排器的单号（<REDACTED_ID> 这类）换成那一单的标题，查不到就说“之前那一单”。"""
+    if isinstance(x, dict):
+        return {k: humanize(v, jobs=jobs) for k, v in x.items()}
+    if isinstance(x, list):
+        return [humanize(v, jobs=jobs) for v in x]
+    if not isinstance(x, str):
+        return x
+    def name(m):
+        try:
+            t = json.load(open(os.path.expanduser("~/amb/jobs/%s/job.json" % m.group(0).split("/")[0])))["title"]
+            return ("「%s」等几单" if "/" in m.group(0) else "「%s」那一单") % pretty_title(t)
+        except (OSError, ValueError, KeyError):
+            return "之前那一单"
+    x = JOB_ID.sub(name, x) if jobs else x
+    return URL_PUNCTUATION.sub(r"\1 \2", x)
+
+def gql(query, variables=None, *, personal=False):
+    validate_board_mutations(query, variables or {})
+    if personal:
+        # The Ambition app lacks the Initiative scope.
+        key = (Path(D) / "key").read_text().strip()
+        return gql_request(query, variables, key, personal=True)
+    access_token = token()
+    try:
+        return gql_request(query, variables, access_token)
+    except LinearAPIError as exc:
+        if exc.status != 401:
+            raise
+    return gql_request(query, variables, token(rejected=access_token))
+
+
+def gql_request(query, variables, access_token, *, personal=False):
+    req = urllib.request.Request(API, data=json.dumps({"query": query, "variables": variables or {}}).encode(),
+                                 headers={"<REDACTED_AUTH_HEADER>": access_token if personal else "<REDACTED_AUTH_SCHEME> " + access_token, "Content-Type": "application/json"})
+    status = 200
+    try:
+        d = json.loads(urllib.request.urlopen(req, timeout=60).read())
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        try:
+            d = json.loads(exc.read())
+        except ValueError:
+            raise LinearAPIError(status) from None
+    if status >= 400 or d.get("errors") or "data" not in d:
+        errors = d.get("errors") or []
+        reasons = [graphql_error_reason(row, access_token) for row in errors[:5]]
+        rate_limited = any(
+            (row.get("extensions") or {}).get("type") == "rateLimited"
+            or (row.get("extensions") or {}).get("code") == "USAGE_LIMIT_EXCEEDED"
+            or "USAGE_LIMIT_EXCEEDED" in str(row.get("message", ""))
+            for row in errors
+        )
+        raise LinearAPIError(status, rate_limited=rate_limited, reasons=reasons)
+    return d["data"]
+
+
+def graphql_error_reason(row, access_token):
+    extensions = row.get("extensions") or {}
+    reason = {}
+    for key in ("code", "type"):
+        value = extensions.get(key)
+        if (isinstance(value, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,39}", value)
+                and not value.lower().startswith("lin_") and access_token not in value):
+            reason[key] = value
+    message = str(row.get("message") or "").replace(access_token, "[已隐藏]")
+    # GraphQL validation messages can echo input values. Keep the reason and
+    # discard quoted payloads, URLs, <REDACTED_AUTH_HEADER> values, and token-like strings.
+    message = re.sub(r"""("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`[^`]*`)""", "[已隐藏]", message)
+    message = re.sub(r"https?://[^\s<>]+", "[URL]", message, flags=re.I)
+    message = re.sub(r"(?i)\b(?:bearer|basic)\s+\S+|\b(?:lin_[\w.-]+|[\w./+=-]{24,})\b",
+                     "[已隐藏]", message)
+    message = re.sub(r"(?i)\b(?:<REDACTED_AUTH_HEADER>|access[_ -]?token|client[_ -]?secret|api[_ -]?key|"
+                     r"password|credential|secret|token)\s*[:=]\s*\S+", "[已隐藏]", message)
+    if message:
+        reason["message"] = " ".join(message.split())[:300]
+    return reason
+
+
+def comment(ident, body):
+    return gql("mutation($i:String!,$b:String!){commentCreate(input:{issueId:$i,body:$b}){success comment{id}}}", {"i": ident, "b": body})
+
+def update(ident, **inp):
+    return gql("mutation($i:String!,$in:IssueUpdateInput!){issueUpdate(id:$i,input:$in){success issue{identifier state{name} assignee{name}}}}", {"i": ident, "in": inp})
+
+def pretty_title(t):
+    """标题要让没看过上下文的人读懂在做什么：只去掉“Fable 统领：”“Ops：”这类执行者前缀，其余不删。"""
+    t = re.sub(r"^\s*(Fable|Ops|OOS|Opus|Sol|Codex|Claude|Astra)[^：:]{0,6}[：:]\s*", "", t.strip(), flags=re.I)
+    return t
+
+SHANGHAI = timezone(timedelta(hours=8))
+DESCRIPTION_BYTES = 12000
+COMMENT_BYTES = 6000
+LONG_LABEL = "<REDACTED_ID>"
+OWNER_RECORD = Path("<REDACTED_PATH>")
+SECTION = re.compile(r"^<!-- amb:(goal|progress|next|products|media|full-result|words|dispatch-note|accepted|approval|ai) -->\n", re.M)
+LEGACY_SECTION = re.compile(r"^(\*\*目标\*\*：|## (?:现在到哪了|结果|下一步|产物|直接看|你的原话|派单时的说明)(?:[^\n]*)\n|\+\+\+ (?:结果全文|你的原话|派单时的说明)[^\n]*\n|给 AI 的提醒：)", re.M)
+HEADING = {
+    "goal": "**目标**：", "progress": "## 现在到哪了", "next": "## 下一步",
+    "products": "## 产物", "media": "## 直接看", "full-result": "## 结果全文", "words": "## 你的原话（全文）",
+    "dispatch-note": "## 派单时的说明",
+    "accepted": "## 验收申请", "approval": "## 你的验收答复",
+    "ai": "给 AI 的提醒：",
+}
+PENDING_REMINDER = HEADING["ai"] + "未收尾事项编号 "
+CANCEL_REASON = "这件事不做了："
+RAW_TOKEN = re.compile(r'#[^\r\n]*|"""(?:\\."""|(?!""")[\s\S])*"""|"(?:\\.|[^"\\])*"|[_A-Za-z][_0-9A-Za-z]*|[{}()]')
+MARKDOWN = MarkdownIt("commonmark").enable("table")
+
+
+class LinearError(Exception):
+    pass
+
+
+class LinearAPIError(LinearError):
+    def __init__(self, status, rate_limited=False, reasons=()):
+        self.status = status
+        self.rate_limited = rate_limited or status == 429
+        self.reasons = list(reasons)
+        reason = "请求限流" if self.rate_limited else "请求失败"
+        super().__init__(f"Linear API {reason}（HTTP {status}）")
+
+
+class WriteRejected(LinearError):
+    """A policy decision the caller can treat as final."""
+
+    exit_code = 3
+
+
+class ReadbackError(LinearError):
+    def __init__(self, ident, expected, actual, expected_html=None, actual_html=None):
+        super().__init__(f"{ident} 卡面回读校验失败")
+        self.issue = ident
+        self.details = {"description": description_difference(expected, actual)}
+        if expected_html is not None and actual_html is not None:
+            self.details["rendered"] = description_difference(expected_html, actual_html, excerpts=False)
+
+
+def description_difference(expected, actual, *, excerpts=True):
+    left, right = expected or "", actual or ""
+    first = next((i for i, (a, b) in enumerate(zip(left, right)) if a != b),
+                 min(len(left), len(right)))
+    start = max(0, first - 20)
+
+    def excerpt(text):
+        # Preserve Markdown structure while masking arbitrary text and credential values.
+        visible = frozenset(" \t\n\r[]()<>*`")
+        return "".join(char if char in visible else "·" for char in text[start:start + 40])
+
+    result = {"expected_chars": len(left), "read_chars": len(right),
+              "read_missing": actual is None, "first_difference": first}
+    if excerpts:
+        result.update(excerpt_start=start, expected_excerpt=excerpt(left), read_excerpt=excerpt(right))
+    return result
+
+
+def checked(payload, key):
+    result = payload.get(key) or {}
+    if result.get("success") is not True:
+        raise LinearError(f"Linear 未确认 {key} 成功")
+    return result
+
+
+def read_only(query):
+    """只允许 query；字符串、注释和嵌套字段不能改变操作类型。"""
+    depth = 0
+    for match in RAW_TOKEN.finditer(query):
+        token = match.group()
+        if token in ("{", "("):
+            depth += 1
+        elif token in ("}", ")"):
+            depth -= 1
+        elif depth == 0 and token in {"mutation", "subscription"}:
+            raise LinearError("gql 只读。改状态请用 state，其他写入请用对应子命令。")
+
+
+BOARD_WRITES = {
+    resource + operation
+    for resource in ("initiative", "initiativeUpdate", "project", "projectMilestone")
+    for operation in ("Create", "Update")
+}
+BOARD_ID = re.compile(r"(?<![\w-])[A-Z][A-Z0-9]{0,15}[-‐‑‒–—－][0-9]+(?![0-9])|"
+                      r"(?<![\w-])J-\d{4}-\w+(?:[./-]\w+)*", re.IGNORECASE | re.ASCII)
+BOARD_UUID = re.compile(r"\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b", re.IGNORECASE)
+BOARD_ISSUE_URL = re.compile(r"(?:https?://)?(?:[\w-]+\.)?linear\.(?:app|com)/[^\s<>()]*?/issues?/"
+                             r"|(?:https?://)?(?:[\w-]+\.)?linear\.(?:app|com)/issues?/", re.IGNORECASE)
+BOARD_TEXT_FIELDS = ("name", "description", "content", "body")
+
+
+def board_text_violations(data):
+    violations = []
+    for field in BOARD_TEXT_FIELDS:
+        value = data.get(field)
+        if not isinstance(value, str):
+            continue
+        value = unescape(urllib.parse.unquote(value))
+        value = "".join(character for character in value if category(character) != "Cf")
+        if BOARD_ID.search(BOARD_UUID.sub("", value)) or BOARD_ISSUE_URL.search(value):
+            violations.append(field)
+    return violations
+
+
+def validate_board_text(data):
+    if board_text_violations(data):
+        raise WriteRejected("概述、Initiative 更新和里程碑只写目标、范围、进展或验收。请用事项名称，任务编号和链接放到执行记录。")
+
+
+def validate_board_mutations(query, variables):
+    tokens = [m.group() for m in RAW_TOKEN.finditer(query)]
+    if "mutation" not in tokens or BOARD_WRITES.isdisjoint(tokens):
+        return
+    # Board writes use a single operation with a typed input variable. Reject
+    # inline inputs, fragments and aliases so all submitted text is checked.
+    for name in BOARD_WRITES.intersection(tokens):
+        if not re.fullmatch(
+            r"\s*mutation\s*\(\s*\$input\s*:\s*" + name[0].upper() + name[1:] +
+            r"Input!\s*(?:,\s*\$id\s*:\s*String!\s*)?\)\s*\{\s*" + name +
+            r"\s*\(\s*(?:id:\s*\$id\s*,\s*)?input:\s*\$input\s*\)\s*\{"
+            r"[\w\s{}]+\}\s*\}\s*", query
+        ) or not isinstance(variables.get("input"), dict):
+            raise WriteRejected("看板概述写入必须使用 linear-app board-edit 或标准的单操作 input 变量。")
+        validate_board_text(variables["input"])
+
+
+def board_edit(args):
+    fields = {"name": args.name, "description": args.description}
+    if args.content_file:
+        fields["body" if args.resource == "initiativeUpdate" else "content"] = text_file(args.content_file)
+    fields = {field: value for field, value in fields.items() if value is not None}
+    if not fields or (args.resource == "projectMilestone" and "content" in fields) or (
+        args.resource == "initiativeUpdate" and set(fields) != {"body"}
+    ):
+        raise WriteRejected("请选择适用于该对象的写入字段。")
+    validate_board_text(fields)
+    selection = "id " + " ".join(fields)
+    query = "query($id:String!){" + args.resource + "(id:$id){" + selection + "}}"
+    variables = {"id": args.ident}
+    if not gql(query, variables, personal=True).get(args.resource):
+        raise LinearError("找不到该看板对象。")
+    save_board_resource(args.resource, args.resource + "{id}", fields, args.ident, personal=True)
+    for delay in READBACK_DELAYS:
+        if delay:
+            time.sleep(delay)
+        row = gql(query, variables, personal=True)[args.resource]
+        if row and not board_text_violations(row) and all(
+            markdown_matches(value, row.get(field), rendered_description(value))
+            if field in {"content", "body"} else value == row.get(field)
+            for field, value in fields.items()
+        ):
+            print(json.dumps(row, ensure_ascii=False))
+            return
+    raise LinearError("看板文案回读与写入不一致。")
+
+
+def board_audit(include_archived=False):
+    selections = {
+        "initiatives": "name description content",
+        "initiativeUpdates": "body",
+        "projects": "name description content",
+        "projectMilestones": "name description",
+    }
+    findings, counts = [], {}
+    for resource, fields in selections.items():
+        after = None
+        counts[resource] = 0
+        while True:
+            query = ("query($after:String,$archived:Boolean){"
+                     + resource + "(first:50,after:$after,includeArchived:$archived)"
+                     "{nodes{id archivedAt " + fields + "} pageInfo{hasNextPage endCursor}}}")
+            page = gql(query, {"after": after, "archived": include_archived}, personal=True)[resource]
+            for row in page["nodes"]:
+                counts[resource] += 1
+                violations = board_text_violations(row)
+                if violations:
+                    findings.append({"resource": resource, "id": row["id"], "name": row.get("name"),
+                                     "archivedAt": row.get("archivedAt"), "fields": violations})
+            if not page["pageInfo"]["hasNextPage"]:
+                break
+            after = page["pageInfo"]["endCursor"]
+    print(json.dumps({"counts": counts, "findings": findings}, ensure_ascii=False))
+    return 3 if findings else 0
+
+
+def issue(ident):
+    found = gql('query($i:String!){issue(id:$i){id identifier title description updatedAt archivedAt project{id} state{id name} assignee{id} '
+                'labels(first:1,filter:{name:{eq:"长期"}}){nodes{id}}}}', {"i": ident}).get("issue")
+    if not found:
+        raise LinearError(f"找不到卡 {ident}")
+    return found
+
+
+def writable_issue(ident):
+    card = issue(ident)
+    if card.get("archivedAt"):
+        raise WriteRejected(f"{card['identifier']} 已归档")
+    return card
+
+
+def is_long(card):
+    return bool(card["labels"]["nodes"])
+
+
+def text_file(path):
+    if not path:
+        raise LinearError("请提供正文文件")
+    text = Path(path).expanduser().read_bytes().decode("utf-8")
+    if not text.strip():
+        raise LinearError("正文文件为空")
+    return text
+
+
+def stamp():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def timestamp(value):
+    when = datetime.fromisoformat(value)
+    if when.tzinfo is None:
+        raise LinearError("时间需要带时区")
+    return when
+
+
+def display_time(value):
+    return timestamp(value).astimezone(SHANGHAI).strftime("%m-%d %H:%M")
+
+
+def quote(text):
+    return "\n".join("> " + line if line else ">" for line in text.split("\n"))
+
+
+def fold(title, body):
+    # Linear GraphQL Markdown: <REDACTED_URL>
+    return f"+++ {title}\n\n{body}\n\n+++"
+
+
+def original_words(brief, words):
+    """优先使用明确的原话字段，其次读现有直通输入的用户原话段。"""
+    if words is not None:
+        return words if words.strip() else ""
+    tagged = re.search(r"^(?:## +)?用户原话(?:[（(][^）)\n]*[）)])?(?:[：:][ \t]*|[ \t]*\n)", brief, re.M)
+    if tagged:
+        source = brief[tagged.end():].removeprefix("\n")
+        boundary = r"^(?:## +)?(?:Fable（统领）的安排|方案文档|前序结果|执行条件|在哪|材料|产出|转写更正|取证)(?:[：:]|[（(]|[ \t]*$)"
+        source = re.split(boundary, source, flags=re.M, maxsplit=1)[0]
+        return source if source.strip() else ""
+
+    intro = re.split(r"^[ \t]{0,3}##(?:[ \t]+|$)", brief, flags=re.M, maxsplit=1)[0]
+    quote_pattern = r"“[^”]+”"
+    quoted = []
+    for line in intro.splitlines():
+        line = line.strip()
+        if (re.match(r"^(?:（(?:\d{2}-\d{2} )?\d{1,2}:\d{2}）|童成卓|用户)", line)
+                or re.fullmatch(quote_pattern, line)):
+            quoted.extend(re.findall(quote_pattern, line))
+    return "\n".join(quoted)
+
+
+def dispatch_note(brief):
+    heading = r"[ \t]{0,3}#{1,6}(?:[ \t]+[^\n]*|(?=\n|$))"
+    prose = re.sub(rf"^(?:{heading}(?:\n|$)\s*)+", "", brief.strip(), count=1)
+    paragraph = re.split(rf"\n(?:[ \t]*\n|{heading})", prose, maxsplit=1)[0].strip()
+    if len(paragraph) <= 300:
+        return paragraph
+    boundary = max((match.end() for match in re.finditer(r'(?:[。！？!?]+|\.(?=\s|$))[”’」』）)]*', paragraph)
+                    if match.end() <= 300), default=0)
+    return paragraph[:boundary] if boundary else paragraph[:299].rstrip() + "…"
+
+
+def section(name, body):
+    return f"<!-- amb:{name} -->\n\n{body}"
+
+
+def legacy_segments(desc, title):
+    defaults = {
+        "goal": HEADING["goal"] + title,
+        "progress": HEADING["progress"] + "\n这一单正在进行。",
+        "next": HEADING["next"] + "\n执行者负责推进并报告结果。",
+    }
+    matches = list(LEGACY_SECTION.finditer(desc))
+    if not matches:
+        return "", {**defaults, **({"words": desc} if desc else {})}
+    for i, match in enumerate(matches):
+        heading = match[1]
+        key = next((k for k, label in HEADING.items() if heading.startswith(label)), None)
+        if not key:
+            key = ("words" if "你的原话" in heading else
+                   "dispatch-note" if "派单时的说明" in heading else
+                   "full-result" if "结果全文" in heading else "progress")
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(desc)
+        defaults[key] = desc[match.start():end].removesuffix("\n\n")
+    return desc[:matches[0].start()], defaults
+
+
+def segments(card):
+    desc = card.get("description") or ""
+    parts = list(SECTION.finditer(desc))
+    if not parts:
+        return legacy_segments(desc, card["title"])
+    prefix = desc[:parts[0].start()]
+    blocks = {match[1]: desc[match.end():parts[idx + 1].start() if idx + 1 < len(parts) else len(desc)].strip("\n")
+              for idx, match in enumerate(parts)}
+    return prefix, blocks
+
+
+def description(prefix, blocks):
+    return humanize(prefix + "\n\n".join(section(key, blocks[key]) for key in HEADING if key in blocks), jobs=False)
+
+
+def rendered_description(text):
+    def split_bold_at_code(match):
+        parts = re.split(r"(<code>.*?</code>)", match[1], flags=re.S)
+        for i in range(0, len(parts), 2):
+            part = parts[i]
+            if part.strip():
+                parts[i] = re.sub(r"(?s)^(\s*)(\S(?:.*\S)?)(\s*)$", r"\1<strong>\2</strong>\3", part)
+        return "".join(parts)
+
+    # Linear serializes inline code outside bold spans, keeping the surrounding text bold.
+    # CommonMark treats everything up to the next blank line after a comment
+    # as raw HTML. Linear separates our section markers from the Markdown body.
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    for token in reversed(MARKDOWN.parse(text)):
+        if token.type == "html_block" and SECTION.match(token.content):
+            start, end = token.map
+            if end > start + 1:
+                lines.insert(start + 1, "")
+    tokens = MARKDOWN.parse("\n".join(lines))
+    # Linear can tighten either kind of Markdown list. Ignore the optional
+    # wrapper around the item's first paragraph, and keep later paragraphs,
+    # list nesting, and ordered-list start numbers in the rendered comparison.
+    for start, opening, body, closing in zip(
+        tokens, tokens[1:], tokens[2:], tokens[3:]
+    ):
+        if (start.type == "list_item_open" and opening.type == "paragraph_open"
+                and body.type == "inline" and closing.type == "paragraph_close"):
+            opening.hidden = closing.hidden = True
+    def preserve_image_alt_text(children, in_image=False):
+        for child in children:
+            # markdown-it's image renderer reads text tokens but skips text_special,
+            # which holds the decoded character for escapes and HTML entities.
+            if in_image and child.type == "text_special":
+                child.type = "text"
+            if child.children:
+                preserve_image_alt_text(child.children, in_image or child.type == "image")
+
+    for token in tokens:
+        if token.children:
+            preserve_image_alt_text(token.children)
+    html = MARKDOWN.renderer.render(tokens, MARKDOWN.options, {})
+    # Linear merges adjacent unordered lists that used different markers.
+    html = html.replace("</ul>\n<ul>\n", "")
+    html = re.sub(r"<strong>(.*?)</strong>",
+                  lambda match: split_bold_at_code(match) if "<code>" in match[1] else match[0],
+                  html, flags=re.S)
+    # A UTF-8 BOM in the first CSV column is stripped by Linear's table parser.
+    html = re.sub(r"(<tr>\n<th(?: [^>]+)?>)\ufeff", r"\1", html)
+    # Uploaded file links may come back with an asset ID in place of the name.
+    return HTTP_LINK.sub(lambda link: f'<a href="{link["href"]}">{link["href"]}</a>'
+                         if link["href"].startswith("https://uploads.linear.app/") else link[0], html)
+
+
+HTTP_LINK = re.compile(r'<a href="(?P<href>https?://[^"<>\s]+)">(?P<label>[^<>]+)</a>')
+LINEAR_ISSUE_URL = re.compile(
+    r"https://linear\.app/[A-Za-z0-9_-]+/issue/(?P<key>[A-Z][A-Z0-9]*-[0-9]+)(?:/[A-Za-z0-9%_-]+)?(?:#comment-[0-9a-fA-F-]+)?"
+)
+# Linear autolinks dotted URI registered names, including assignments such as
+# hostname=node.example.com. The destination must still match the whole label.
+BARE_LINK_HOST = re.compile(r"(?:[A-Za-z0-9_~!$&'()*+,;=-]+\.)+[A-Za-z]{2,63}(?=[/?#]|$)")
+URL_PREFIX = re.compile(r"[A-Za-z0-9_@./-]")
+URL_TRAILING_ASCII = re.compile(r"[.,;:!?)\]}]*")
+# Linear lowercases this app handle in prose. Keep code, markup and URLs exact.
+APP_MENTION = re.compile(
+    r"<!--.*?-->|<(?P<tag>pre|code|a)\b[^>]*>.*?</(?P=tag)>|<[^>]*>"
+    r"|(?P<handle>(?<![\w@./-])@Ambition(?![\w@./-]))", re.S
+)
+
+
+def linear_app_mentions(html):
+    return APP_MENTION.sub(lambda match: "@ambition" if match["handle"] else match[0], html)
+
+
+def autolink_ends_at(html, pos):
+    end = URL_TRAILING_ASCII.match(html, pos).end()
+    if end == len(html):
+        return True
+    if html.startswith(("&quot;", "&#39;", "&#x27;"), end):
+        return True
+    char = html[end]
+    # Linear can stop at an opening or closing bracket or quote adjoining the URL.
+    return (char.isspace() or char in "<'，。；：！？、…"
+            or (not char.isascii() and category(char) in {"Ps", "Pe", "Pi", "Pf"}))
+
+
+def matches_autolinked_description(expected_html, actual_html):
+    """Match automatic links, including Linear issue URLs displayed as issue keys."""
+    expected_pos = actual_pos = 0
+    for link in HTTP_LINK.finditer(actual_html):
+        label, href = link["label"], link["href"]
+        url = unescape(label)
+        same_url = url.startswith(("http://", "https://")) and MARKDOWN.normalizeLink(url) == unescape(href)
+        # Linear also autolinks Unicode host text and serializes it as Punycode.
+        bare_url = MARKDOWN.normalizeLink("http://" + url)
+        bare_host = (bare_url == unescape(href)
+                     and BARE_LINK_HOST.match(bare_url.removeprefix("http://")))
+        issue_url = LINEAR_ISSUE_URL.fullmatch(href)
+        issue_label = issue_url is not None and label == issue_url["key"]
+        if not (label == href or same_url or bare_host or issue_label):
+            continue
+        before = actual_html[actual_pos:link.start()]
+        if not expected_html.startswith(before, expected_pos):
+            return False
+        expected_pos += len(before)
+        if expected_html.startswith(link[0], expected_pos):
+            expected_pos += len(link[0])
+        else:
+            source = href if issue_label else label
+            end = expected_pos + len(source)
+            if expected_pos and URL_PREFIX.fullmatch(expected_html[expected_pos - 1]):
+                return False
+            if not expected_html.startswith(source, expected_pos):
+                return False
+            # Linear autolinks bare hosts in comma-separated filenames, such as
+            # {merge.py,export_pdf.sh}. Keep stricter boundaries for explicit URLs.
+            bare_host_before_comma = bare_host and expected_html.startswith(",", end)
+            if not (bare_host_before_comma or autolink_ends_at(expected_html, end)):
+                return False
+            expected_pos = end
+        actual_pos = link.end()
+    return expected_html[expected_pos:] == actual_html[actual_pos:]
+
+
+READBACK_DELAYS = (0, 0.15, 0.35)
+
+
+def text_digest(text):
+    normalized = "\n".join(line.rstrip() for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"))
+    return hashlib.sha256(normalized.encode()).digest()
+
+
+def markdown_matches(expected, actual, expected_html):
+    if actual is None:
+        return False
+    if actual == expected:
+        return True
+    actual_html = rendered_description(actual)
+    if (text_digest(expected_html) == text_digest(actual_html)
+            or matches_autolinked_description(expected_html, actual_html)):
+        return True
+    mention_html = linear_app_mentions(expected_html)
+    return (mention_html != expected_html
+            and (text_digest(mention_html) == text_digest(actual_html)
+                 or matches_autolinked_description(mention_html, actual_html)))
+
+
+def verify(ident, expected):
+    expected_html = rendered_description(expected)
+    readbacks = []
+    for delay in READBACK_DELAYS:
+        if delay:
+            time.sleep(delay)
+        card = issue(ident)
+        actual = card.get("description")
+        if markdown_matches(expected, actual, expected_html):
+            return
+        readbacks.append(card.get("updatedAt"))
+    actual_html = rendered_description(actual) if actual is not None else None
+    error = ReadbackError(ident, expected, actual, expected_html, actual_html)
+    error.details["read_updated_at"] = readbacks
+    raise error
+
+
+def write_description(card, prefix, blocks, *, finished=False, **kwargs):
+    if is_long(card) and not finished and (card.get("state") or {}).get("name") != "Done":
+        for key in ("goal", "progress", "next"):
+            if not blocks.get(key, "").partition(HEADING[key])[2].strip():
+                raise LinearError(f"长期卡缺少{HEADING[key]}")
+    desc = description(prefix, blocks)
+    if len(desc.encode()) > DESCRIPTION_BYTES:
+        raise LinearError("卡面超过安全长度")
+    checked(update(card["id"], description=desc, **kwargs), "issueUpdate")
+    verify(card["id"], desc)
+
+
+def report_error(command, ident, error):
+    directory = Path(D)
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(directory / "linear-events.jsonl", os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+    message = str(error) if isinstance(error, LinearError) else type(error).__name__
+    event = {"ts": stamp(), "event": "linear_write_failed",
+             "command": command, "issue": ident, "error": message}
+    if isinstance(error, LinearAPIError):
+        event["api"] = {"status": error.status, "rate_limited": error.rate_limited,
+                        "graphql_errors": error.reasons}
+    if isinstance(error, ReadbackError):
+        event["issue_uuid"] = error.issue
+        event["readback"] = error.details
+    with os.fdopen(fd, "a") as stream:
+        stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+    sys.path.insert(0, str(Path.home() / "amb"))
+    import amb_events
+    suffix = hashlib.sha256(f"{command} {ident} {message}".encode()).hexdigest()[:12]
+    amb_events.emit(Path.home() / "amb", ident or "Linear", "Linear 卡面写入失败", "blocked",
+                    message, f"{directory / 'linear-events.jsonl'}#{suffix}")
+
+
+def split_full_text(text):
+    """优先沿段落、句子分割，连接后仍是原文。"""
+    sizes = [0]
+    for char in text:
+        sizes.append(sizes[-1] + len(char.encode()) + (2 if char == "\n" else 0))
+    start = 0
+    while start < len(text):
+        limit = bisect_right(sizes, sizes[start] + COMMENT_BYTES - 120, lo=start + 1) - 1
+        if limit < len(text):
+            paragraph = text.rfind("\n\n", start, limit)
+            if paragraph >= start:
+                limit = paragraph + 2
+            else:
+                boundary = max(text.rfind(mark, start, limit) for mark in ("。", "！", "？", ". ", "\n"))
+                if boundary >= start:
+                    limit = boundary + 1
+        yield text[start:limit]
+        start = limit
+
+
+def comments(ident):
+    return pages(ident, "comments", "id body")
+
+
+def comment_on_issue(issue_id, comment_id):
+    data = gql(
+        "query($i:String!,$c:ID!){viewer{id} issue(id:$i){"
+        "comments(first:1,filter:{id:{eq:$c}}){nodes{id body user{id} botActor{name}}}}}",
+        {"i": issue_id, "c": comment_id},
+    )
+    if not data.get("issue"):
+        raise LinearError(f"找不到卡 {issue_id}")
+    nodes = data["issue"]["comments"]["nodes"]
+    return (nodes[0] if nodes else None), data["viewer"]["id"]
+
+
+def change_comment(a, card):
+    ident, comment_id = card["identifier"], a.comment_id
+    original, viewer_id = comment_on_issue(card["id"], comment_id)
+    if original is None:
+        raise WriteRejected(f"{ident} 找不到评论 {comment_id}")
+    bot = original.get("botActor")
+    is_own = bot.get("name") == "Ambition" if bot else (original.get("user") or {}).get("id") == viewer_id
+    if not is_own:
+        raise WriteRejected("只能改 Ambition 自己发的评论")
+
+    variables = {"id": comment_id}
+    editing = a.cmd == "comment-edit"
+    if editing:
+        body = text_file(a.file)
+        if original["body"] != body:
+            checked(gql("mutation($id:String!,$input:CommentUpdateInput!){"
+                        "commentUpdate(id:$id,input:$input){success}}",
+                        {**variables, "input": {"body": body}}), "commentUpdate")
+    else:
+        event = {"issue": ident, "comment_id": comment_id, "ts": stamp(), "body": original["body"]}
+        fd = os.open(Path(D) / "deleted-comments.jsonl", os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        checked(gql("mutation($id:String!){commentDelete(id:$id){success}}", variables), "commentDelete")
+
+    for delay in READBACK_DELAYS:
+        if delay:
+            time.sleep(delay)
+        posted, _ = comment_on_issue(card["id"], comment_id)
+        if editing and posted is not None and posted["body"] == body:
+            print("正文一致")
+            return
+        if not editing and posted is None:
+            print("评论已删除")
+            return
+    raise LinearError(f"{ident} 评论 {comment_id} 回读校验失败")
+
+
+def comment_once(ident, body):
+    body = humanize(body, jobs=False)
+    if any(c["body"] == body for c in comments(ident)):
+        return
+    result = checked(comment(ident, body), "commentCreate")
+    posted = gql("query($i:String!){comment(id:$i){body}}", {"i": result["comment"]["id"]})
+    if (posted.get("comment") or {}).get("body") != body:
+        raise LinearError(f"{ident} 评论回读校验失败")
+
+
+def full_text_comments(ident, label, full):
+    full = humanize(full, jobs=False)
+    chunks = list(split_full_text(full))
+    known = {c["body"] for c in comments(ident)}
+    readback = []
+    for number, chunk in enumerate(chunks, 1):
+        heading = f"**{label} {number}/{len(chunks)}**"
+        body = heading + "\n\n" + quote(chunk)
+        stored = body
+        if body not in known:
+            result = checked(comment(ident, body), "commentCreate")
+            for delay in READBACK_DELAYS:
+                if delay:
+                    time.sleep(delay)
+                posted = gql("query($i:String!){comment(id:$i){body}}", {"i": result["comment"]["id"]})
+                stored = (posted.get("comment") or {}).get("body") or ""
+                if text_digest(stored) == text_digest(body):
+                    break
+            else:
+                raise LinearError(f"{ident} 评论回读校验失败")
+        actual_heading, _, quoted = stored.replace("\r\n", "\n").replace("\r", "\n").partition("\n\n")
+        if actual_heading.rstrip() != heading:
+            raise LinearError(f"{ident} 评论分片编号回读失败")
+        readback.append("\n".join(line[2:] if line.startswith("> ") else "" if line == ">" else line
+                                  for line in quoted.split("\n")))
+    if text_digest("".join(readback)) != text_digest(full):
+        raise LinearError(f"{ident} 评论全文回读校验失败")
+    return f"全文见下方评论（{label} 1/{len(chunks)} 到 {len(chunks)}/{len(chunks)}）。"
+
+
+def conclusion(text):
+    for para in re.split(r"\n[ \t]*\n", text):
+        body = "\n".join(line for line in para.splitlines() if not line.lstrip().startswith("#")).strip()
+        if body:
+            return body
+    return text.strip()
+
+
+def human_result(text):
+    text, _ = split_summary_message(text)
+    text = re.sub(r"^# J-\d{4}-\S+ (?:done|failed|blocked|cancelled) · 第 \d+ 次 · 执行 [^\n]*\n?", "", text, flags=re.M)
+    text = re.sub(r"^详情：[^\n]*\n?", "", text, flags=re.M)
+    text = re.sub(
+        r"^证据：[^\n]*",
+        lambda m: re.sub(r"；(?:sha [^；\n]*|(?:未合并|已合并)(?:（[^）\n]*）)?)(?=；|$)", "", m[0]),
+        text, flags=re.M,
+    )
+    first = " ".join(conclusion(text).split())
+    lines = [line for line in text.splitlines()
+             if not (line.startswith("结论：") and " ".join(line.removeprefix("结论：").split()) == first)]
+    return "\n".join(lines).strip()
+
+
+def write_result(card, path, full, approval=None):
+    prefix, blocks = segments(card)
+    full = humanize(human_result(full))
+    summary = conclusion(full) or "本轮执行已结束。"
+    result_heading = "## 结果"
+    blocks.pop("next", None)
+    if not approval:
+        blocks.pop("accepted", None)
+    if blocks.get("ai", "").startswith(PENDING_REMINDER):
+        blocks.pop("ai")
+    blocks["progress"] = result_heading + "\n" + summary
+    products = blocks.get("products", HEADING["products"])
+    products = re.sub(r"\n[-*+] 结果文件：<REDACTED_HOST_B> 上的 [^\n]*", "", products).rstrip("\n")
+    tokens = MARKDOWN.parse(products)
+    # Linear rewrites adjacent bullet lists with mixed markers as one list.
+    marker = tokens[-1].markup if tokens and tokens[-1].type == "bullet_list_close" else "*"
+    products += f"\n{marker} 结果文件：<REDACTED_HOST_B> 上的 `{Path(path).expanduser().resolve()}`"
+    blocks["products"] = products
+    sections = {}
+    if full and full != summary:
+        blocks["full-result"] = fold("结果全文", quote(full))
+        sections["full-result"] = (HEADING["full-result"], "结果全文", full, full)
+    else:
+        blocks.pop("full-result", None)
+    if full:
+        sections["progress"] = (result_heading, "结果全文", full, summary)
+    if approval:
+        reply_header = (HEADING["approval"] + "\n" + display_time(approval["received_at"])
+                        + "（" + approval["id"] + "）")
+        blocks["approval"] = reply_header + "\n" + quote(approval["text"])
+        sections["approval"] = (reply_header, "验收回复全文", approval["text"], approval["text"])
+    fit_attachments(card, prefix, blocks, sections)
+    write_description(card, prefix, blocks, finished=True)
+    attach_later(card["identifier"], mentioned_media(path, full))
+
+
+# 产物直接进卡（童成卓 11-22 16:43：“重要的产物，比如说视频……图片……表格，为什么不直接放在那个 issue 里面”）
+MEDIA_KIND = {".png": "image", ".jpg": "image", ".jpeg": "image", ".gif": "image", ".webp": "image",
+              ".mp4": "video", ".mov": "video", ".webm": "video",
+              ".csv": "table", ".tsv": "table", ".pdf": "file", ".xlsx": "file", ".html": "file",
+              ".md": "file", ".txt": "file"}
+CONTENT_TYPE = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+                ".webp": "image/webp", ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm",
+                ".csv": "text/csv", ".tsv": "text/tab-separated-values", ".pdf": "application/pdf",
+                ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".html": "text/html",
+                ".md": "text/markdown", ".txt": "text/plain"}
+UPLOAD_MAX_BYTES = 2 * 1024 ** 3  # 收文件的上限；超过 Linear 单文件上限的视频和图片先压成预览版
+LINEAR_FILE_BYTES = 10 * 1000 * 1000  # Linear 免费版单文件上限 10MB（11-22 实测）
+PREVIEW_BYTES = 9_300_000
+PREVIEWS = Path.home() / ".cache" / "linear-previews"
+MEDIA_MAX_FILES = 20
+TABLE_INLINE_BYTES = 2500
+TEXT_ATTACHMENT_SUFFIXES = {".md", ".txt"}
+LOCAL_PATH = re.compile(r"""(?:~|<REDACTED_PATH>)/[^\s`'"<>()（）\[\]，。；：、]+""")
+UPLOADS = Path(D) / "uploads.json"
+
+
+def media_files(paths, *, include_text=True):
+    """文件原样收；目录收它下面一层的媒体文件。只收 <REDACTED_HOST_B> 上存在的东西。"""
+    suffixes = MEDIA_KIND.keys() if include_text else MEDIA_KIND.keys() - TEXT_ATTACHMENT_SUFFIXES
+    found = []
+    for raw in paths:
+        p = Path(str(raw).rstrip(".,;:")).expanduser()
+        if p.is_dir():
+            found.extend(sorted(x for x in p.iterdir() if x.is_file() and x.suffix.lower() in suffixes))
+        elif p.is_file() and p.suffix.lower() in suffixes:
+            found.append(p)
+    unique = []
+    for p in found:
+        p = p.resolve()
+        if p not in unique and p.stat().st_size <= UPLOAD_MAX_BYTES:
+            unique.append(p)
+    return unique[:MEDIA_MAX_FILES]
+
+
+def mentioned_media(result_path, text):
+    """结果正文里写到的 VPS 路径，加结果文件同目录 deliver.json 列出的文件。"""
+    # Markdown and text need an explicit attachment request. Mentioning a
+    # task directory must not upload its prompts, logs, or other text files.
+    paths = media_files(LOCAL_PATH.findall(text), include_text=False)
+    manifest = Path(result_path).expanduser().parent / "deliver.json"
+    try:
+        listed = json.loads(manifest.read_text(encoding="utf-8")).get("files") or []
+        for item in listed:
+            paths.extend(str(x) for x in manifest.parent.glob(item)) if not os.path.isabs(item) else paths.append(item)
+    except (OSError, ValueError, AttributeError):
+        pass
+    return media_files(paths)
+
+
+def preview(path):
+    """超过 Linear 单文件上限时，视频转 H.264 预览、图片缩小；做不到返回 None。"""
+    import subprocess
+    kind = MEDIA_KIND[path.suffix.lower()]
+    if path.stat().st_size <= LINEAR_FILE_BYTES:
+        return path
+    if kind not in ("video", "image"):
+        return None
+    PREVIEWS.mkdir(parents=True, exist_ok=True)
+    st = path.stat()
+    key = hashlib.sha256(f"{path}:{st.st_size}:{st.st_mtime_ns}".encode()).hexdigest()[:16]
+    out = PREVIEWS / f"{path.stem}-{key}{'.mp4' if kind == 'video' else '.jpg'}"
+    if out.is_file() and out.stat().st_size <= PREVIEW_BYTES:
+        return out
+    if kind == "image":
+        for width in (3000, 2000, 1400, 1000):
+            subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", str(path), "-vf", f"scale='min({width},iw)':-2",
+                            "-q:v", "3", str(out)], check=True, timeout=300)
+            if out.stat().st_size <= PREVIEW_BYTES:
+                return out
+        return None
+    seconds = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0",
+                                    str(path)], capture_output=True, text=True, check=True, timeout=60).stdout.strip() or 0)
+    if seconds <= 0:
+        return None
+    budget = PREVIEW_BYTES * 8 / seconds - 96_000
+    for factor in (0.92, 0.75, 0.6):
+        rate = int(budget * factor)
+        if rate < 150_000:
+            return None
+        height = 1080 if rate > 4_000_000 else 720 if rate > 1_200_000 else 480
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", str(path), "-vf", f"scale=-2:'min({height},ih)'",
+                        "-c:v", "libx264", "-preset", "medium", "-b:v", str(rate), "-maxrate", str(int(rate * 1.2)),
+                        "-bufsize", str(rate * 2), "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                        "-c:a", "aac", "-b:a", "96k", str(out)], check=True, timeout=1800)
+        if out.stat().st_size <= PREVIEW_BYTES:
+            return out
+    return None
+
+
+def upload(path):
+    """传到 Linear 自己的文件存储，返回卡面可直接显示的地址；同一内容只传一次。"""
+    path = preview(path)
+    if path is None:
+        return None
+    data = path.read_bytes()
+    # Text downloads carry the requested filename, even when two cards
+    # happen to have identical prose.
+    cache_key = hashlib.sha256(data)
+    if path.suffix.lower() in TEXT_ATTACHMENT_SUFFIXES:
+        cache_key.update(b"\0" + path.name.encode())
+    digest = cache_key.hexdigest()
+    try:
+        cache = json.loads(UPLOADS.read_text())
+    except (OSError, ValueError):
+        cache = {}
+    if digest in cache:
+        return cache[digest]
+    kind = CONTENT_TYPE.get(path.suffix.lower(), "application/octet-stream")
+    payload = checked(gql("mutation($c:String!,$f:String!,$s:Int!){fileUpload(contentType:$c,filename:$f,size:$s)"
+                          "{success uploadFile{uploadUrl assetUrl headers{key value}}}}",
+                          {"c": kind, "f": path.name, "s": len(data)}), "fileUpload")["uploadFile"]
+    headers = {h["key"]: h["value"] for h in payload["headers"]}
+    headers.update({"Content-Type": kind, "Cache-Control": "public, max-age=31536000"})
+    req = urllib.request.Request(payload["uploadUrl"], data=data, headers=headers, method="PUT")
+    with urllib.request.urlopen(req, timeout=900) as response:
+        if response.status not in (200, 201):
+            raise LinearError(f"{path.name} 上传失败（HTTP {response.status}）")
+    cache[digest] = payload["assetUrl"]
+    tmp = UPLOADS.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cache, ensure_ascii=False))
+    os.replace(tmp, UPLOADS)
+    return payload["assetUrl"]
+
+
+def table_markdown(path):
+    import csv
+    rows = list(csv.reader(path.read_text(encoding="utf-8-sig", errors="replace").splitlines(),
+                           delimiter="\t" if path.suffix.lower() == ".tsv" else ","))[:21]
+    if not rows:
+        return ""
+    width = max(len(r) for r in rows)
+    # Linear serializes literal pipes without escapes, turning them into column breaks.
+    def cell(value):
+        value = value.replace("|", "｜").strip()
+        # Linear rewrites an unescaped standalone hyphen as a bullet.
+        return r"\-" if value == "-" else value or " "
+
+    lines = ["| " + " | ".join(cell(v) for v in r + [""] * (width - len(r))) + " |" for r in rows]
+    lines.insert(1, "|" + " --- |" * width)
+    text = "\n".join(lines)
+    return text if len(text.encode()) <= TABLE_INLINE_BYTES else ""
+
+
+def media_entry(path, url):
+    kind = MEDIA_KIND[path.suffix.lower()]
+    if kind == "image":
+        return f"![{path.name}]({url})"
+    # 视频：单独成段、指向上传文件的链接，Linear 显示为带播放控件的视频块（11-22 实测）
+    if kind == "table":
+        table = table_markdown(path)
+        return (table + "\n\n" if table else "") + f"[{path.name}]({url})"
+    return f"[{path.name}]({url})"
+
+
+def remove_media(current, filename):
+    """Remove prior entries for this filename, including standalone captions and tables."""
+    link = re.compile(r"^!?\[" + re.escape(filename) + r"\]\(")
+    caption = filename + "：卡上是压缩预览"
+    too_large = re.compile(r"^[-*+] " + re.escape(filename) + r"：超过 Linear 单文件")
+    kept = []
+    for paragraph in re.split(r"\n[ \t]*\n", current):
+        if paragraph.startswith(caption) or too_large.match(paragraph):
+            continue
+        if link.match(paragraph):
+            if kept and kept[-1].lstrip().startswith("|"):
+                kept.pop()
+            continue
+        kept.append(paragraph)
+    return "\n\n".join(kept)
+
+
+def attach_media(card, files):
+    """把文件上传进卡，写进“直接看”段：图片和表格直接显示，视频和其他文件点开即看。已有的不重复写。"""
+    if not files:
+        return []
+    prefix, blocks = segments(card)
+    current = blocks.get("media", HEADING["media"] + "\n图片和表格直接显示，视频点开即播；原件在 <REDACTED_HOST_B>，路径见“产物”。")
+    added = []
+    for path in files:
+        prior = current
+        current = remove_media(current, path.name)
+        url = upload(path)
+        if url is None:  # 超过 Linear 单文件上限又压不下来：写明原件位置
+            note = f"- {path.name}：超过 Linear 单文件 10MB 上限，原件在 <REDACTED_HOST_B> 的 `{path}`"
+            current += "\n\n" + note
+            if current != prior:
+                added.append(path.name)
+            continue
+        if url in current:
+            continue
+        entry = media_entry(path, url)
+        if path.stat().st_size > LINEAR_FILE_BYTES:  # 说明单独成段，视频链接单独成段才显示成播放器
+            entry = f"{path.name}：卡上是压缩预览，原片在 <REDACTED_HOST_B> 的 `{path}`\n\n" + entry
+        if len((description(prefix, {**blocks, "media": current + "\n\n" + entry})).encode()) > DESCRIPTION_BYTES:
+            entry = f"[{path.name}]({url})"
+            if len((description(prefix, {**blocks, "media": current + "\n\n" + entry})).encode()) > DESCRIPTION_BYTES:
+                comment_once(card["id"], f"**直接看（卡面放不下，补在这里）**\n\n" + media_entry(path, url))
+                added.append(path.name)
+                continue
+        current += "\n\n" + entry
+        if current != prior:
+            added.append(path.name)
+    if current != blocks.get("media"):
+        blocks["media"] = current
+        write_description(card, prefix, blocks)
+    return added
+
+
+def attach_later(ident, files):
+    """结果先上卡，大文件在后台上传，不拖慢调用方（调用方只给 20~60 秒）。"""
+    if not files:
+        return
+    import subprocess
+    log = open(Path(D) / "attach.log", "a")
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "attach", ident, *map(str, files)],
+                     stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+
+
+def apply_progress(ident, path, stale=False, older_than=None, *, card=None, paused=False):
+    if older_than and not stale:
+        raise LinearError("--if-older-than 只能用于 --stale")
+    card = writable_issue(ident) if card is None else card
+    if older_than and card["state"]["name"] not in {"In Progress", "Human Intervention"}:
+        return f"inactive {ident}"
+    if older_than and timestamp(card["updatedAt"]) > timestamp(older_than):
+        return f'fresh {ident} {card["updatedAt"]}'
+    if card["state"]["name"] in {"Done", "Canceled"}:
+        return f"inactive {ident}"
+    text = human_result(text_file(path))
+    prefix, blocks = segments(card)
+    blocks.setdefault("products", HEADING["products"])
+    if stale:
+        current = text
+    else:
+        current = re.sub(r"\A## 现在到哪了(?:（[^\n]*）)?\n", "", text.strip())
+        parts = re.split(r"^## 下一步[ \t]*(?:\n|$)", current, maxsplit=1, flags=re.M)
+        current, *pending = parts
+        current = human_result(current)
+        if pending:
+            next_text, _, reminder = pending[0].partition("\n" + HEADING["ai"])
+            pending[0] = human_result(next_text)
+            if reminder.strip():
+                blocks["ai"] = HEADING["ai"] + reminder.strip("\n")
+            elif blocks.get("ai", "").startswith(PENDING_REMINDER):
+                blocks.pop("ai")
+        if not current or (pending and not pending[0]):
+            raise LinearError("现状和下一步都需要写明内容")
+        if pending:
+            blocks["next"] = HEADING["next"] + "\n" + humanize(pending[0])
+    blocks["progress"] = HEADING["progress"] + f"（更新于 {display_time(stamp())}）\n" + humanize(current)
+    updated_sections = ("progress", "next") if not stale and pending else ("progress",)
+    fit_progress(card, prefix, blocks, updated_sections)
+    changes = {"stateId": STATES["Todo"]} if paused and card["state"]["name"] == "In Progress" else {}
+    write_description(card, prefix, blocks, **changes)
+    attach_later(card["identifier"], mentioned_media(path, text))
+    return ident
+
+
+
+def full_text_attachment(card, label, full):
+    name = f"{card['identifier']}-{label}.md"
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / name
+        path.write_text(full, encoding="utf-8")
+        url = upload(path)
+    if url is None:
+        raise LinearError(f"{name} 超过 Linear 单文件上限")
+    return f"全文：[{name}]({url})"
+
+
+def fit_attachments(card, prefix, blocks, sections):
+    """Leave each section's heading and make its preview fit the byte budget."""
+    overflow = []
+    links = {}
+    for key in sorted(sections, key=lambda key: len(blocks[key].encode()), reverse=True):
+        if len(description(prefix, blocks).encode()) <= DESCRIPTION_BYTES:
+            break
+        heading, label, full, preview = sections[key]
+        if label not in links:
+            links[label] = full_text_attachment(card, label, full)
+        link = links[label]
+        compact = f"{heading}\n{link}"
+        if len(compact.encode()) >= len(blocks[key].encode()):
+            continue
+        blocks[key] = compact
+        overflow.append((key, heading, link, preview))
+    remaining = DESCRIPTION_BYTES - len(description(prefix, blocks).encode())
+    if remaining < 0:
+        raise LinearError("卡面超过安全长度")
+    for i, (key, heading, link, preview) in enumerate(overflow):
+        # Leave space for future progress, even if this preview could fill the card.
+        budget = min(1200, max(0, remaining // (len(overflow) - i) - 2))
+        preview = humanize(preview, jobs=False).encode()[:budget].decode(errors="ignore").rstrip()
+        if preview:
+            blocks[key] = f"{heading}\n{preview}\n\n{link}"
+            remaining -= len(preview.encode()) + 2
+
+
+def fit_progress(card, prefix, blocks, updated_sections):
+    sections = {}
+    for key in updated_sections:
+        heading, _, full = blocks[key].partition("\n")
+        label = HEADING[key].removeprefix("## ")
+        preview = full.partition("\n\n**带队子单**")[0]
+        sections[key] = (heading, label, full, preview)
+    fit_attachments(card, prefix, blocks, sections)
+
+
+# Historical and abbreviated names of the navigation algorithm project.
+PROJECT_ALIASES = {
+    "机器狗校园导航": "<REDACTED_ID>",
+    "机器狗导航": "<REDACTED_ID>",
+}
+PROJECT_UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.I)
+
+
+class ProjectResolutionError(LinearError):
+    pass
+
+
+def project_id(name):
+    name = name.strip()
+    if PROJECT_UUID.fullmatch(name):
+        target = name.lower()
+    else:
+        nodes = gql("query($n:String!){projects(first:2,filter:{name:{eq:$n}}){nodes{id archivedAt}}}",
+                    {"n": name})["projects"]["nodes"]
+        active = [node for node in nodes if not node.get("archivedAt")]
+        if len(active) == 1:
+            return active[0]["id"]
+        target = PROJECT_ALIASES.get(name) if not nodes else None
+    if target:
+        nodes = gql("query($id:ID!){projects(first:2,filter:{id:{eq:$id}}){nodes{id archivedAt}}}",
+                    {"id": target})["projects"]["nodes"]
+        if len(nodes) == 1 and nodes[0]["id"] == target and not nodes[0].get("archivedAt"):
+            return target
+    raise ProjectResolutionError(f"Linear 项目不存在或不唯一：{name}")
+
+
+def pages(ident, field, selection):
+    cursor = None
+    while True:
+        query = "query($i:String!,$c:String){issue(id:$i){" + field + "(first:50,after:$c)"
+        query += "{nodes{" + selection + "} pageInfo{hasNextPage endCursor}}}}"
+        page = gql(query, {"i": ident, "c": cursor})["issue"][field]
+        yield from page["nodes"]
+        if not page["pageInfo"]["hasNextPage"]:
+            return
+        cursor = page["pageInfo"]["endCursor"]
+
+
+def mark_long(a, card):
+    project = project_id(a.project) if a.project else (card.get("project") or {}).get("id")
+    if not project or project == PROJECT:
+        raise WriteRejected("长期卡需要自己的项目")
+    if card["state"]["name"] != "In Progress":
+        raise WriteRejected("请先将卡置为 In Progress")
+    labels = [x["id"] for x in pages(card["id"], "labels", "id")]
+    if LONG_LABEL not in labels:
+        labels.append(LONG_LABEL)
+    prefix, blocks = segments(card)
+    write_description({"id": card["id"], "labels": {"nodes": [{"id": LONG_LABEL}]}},
+                      prefix, blocks, labelIds=labels, projectId=project)
+    if a.project:
+        for child in pages(card["id"], "children", "id"):
+            checked(update(child["id"], projectId=project), "issueUpdate")
+    print(a.ident)
+
+
+def create_card(a):
+    title = pretty_title(a.title)
+    goal = (a.goal or "").strip()
+    if not 1 <= len(title) <= 16:
+        raise WriteRejected("卡标题须为 1–16 字")
+    if not 1 <= len(goal) <= 300:
+        raise WriteRejected("卡目标须为 1–300 字（含完成标准）")
+    if goal.rstrip("。.").rstrip() == title:
+        raise WriteRejected("卡目标不能只是重复标题，要写成一句解释加完成标准")
+    if a.long and not (a.project or a.parent):
+        raise WriteRejected("长期卡必须指定 --project 或 --parent")
+    issue_id = getattr(a, "issue_id", None)
+    if issue_id:
+        try:
+            existing = gql("query($id:String!){issue(id:$id){id identifier url}}", {"id": issue_id})["issue"]
+        except LinearAPIError as exc:
+            if not any("Entity not found" in reason.get("message", "") for reason in exc.reasons):
+                raise
+            existing = None
+        if existing:
+            print(existing["identifier"], existing["url"])
+            return
+    parent = None
+    inherited = None
+    if a.parent:
+        parent = gql("query($i:String!){issue(id:$i){id project{id} parent{id project{id}}}}",
+                     {"i": a.parent})["issue"]
+        parent = parent.get("parent") or parent
+        inherited = (parent.get("project") or {}).get("id")
+    project = inherited or PROJECT
+    next_step = "\n执行者负责推进并报告结果。"
+    if a.project:
+        try:
+            project = project_id(a.project)
+        except ProjectResolutionError:
+            if a.long and project == PROJECT:
+                project = None
+            next_step += "\n指定的 Linear 项目不存在或不唯一。请 Ambition 核对并更新项目。"
+    if a.long and project == PROJECT:
+        raise WriteRejected("长期卡需要自己的项目")
+    brief = text_file(a.brief_file) if a.brief_file else a.brief
+    words = text_file(a.user_words_file) if a.user_words_file else a.user_words
+    raw = original_words(brief, words)
+    raw_key = "words" if raw else "dispatch-note"
+    if not raw:
+        raw = dispatch_note(brief)
+    raw_label = HEADING[raw_key].removeprefix("## ")
+    raw_heading = HEADING[raw_key]
+    if a.received_at:
+        raw_heading += f"\n（{display_time(a.received_at)}）"
+    blocks = {
+        "goal": HEADING["goal"] + humanize(goal),
+        "progress": HEADING["progress"] + f"（更新于 {display_time(stamp())}）\n已派发。",
+        "next": HEADING["next"] + next_step,
+        "products": HEADING["products"],
+        **({raw_key: (
+            fold(raw_label, (raw_heading.partition("\n")[2] + "\n").lstrip("\n") + quote(raw))
+            if len(raw) > 300 else raw_heading + "\n" + quote(raw))} if raw else {}),
+    }
+    desc = description("", blocks)
+    overflow = len(desc.encode()) > DESCRIPTION_BYTES
+    if overflow and raw:
+        raw_block = blocks[raw_key]
+        blocks[raw_key] = raw_heading + "\n正在上传全文。"
+        desc = description("", blocks)
+    if len(desc.encode()) > DESCRIPTION_BYTES:
+        raise LinearError("卡面超过安全长度")
+    inp = {"teamId": TEAM, "stateId": STATES["In Progress"],
+           "title": title, "description": desc}
+    if issue_id:
+        inp["id"] = issue_id
+    if project:
+        inp["projectId"] = project
+    if parent:
+        inp["parentId"] = parent["id"]
+    if a.long:
+        inp["labelIds"] = [LONG_LABEL]
+    result = gql("mutation($in:IssueCreateInput!){issueCreate(input:$in){success issue{id identifier url}}}", {"in": inp})
+    card = checked(result, "issueCreate")["issue"]
+    # A post-create failure must point to the card that already exists.
+    a.ident = card["identifier"]
+    verify(card["id"], desc)
+    if overflow and raw:
+        stored = issue(card["id"])
+        blocks[raw_key] = raw_block
+        fit_attachments(card, "", blocks, {raw_key: (raw_heading, raw_label, raw, quote(raw))})
+        write_description(stored, "", blocks)
+    print(card["identifier"], card["url"])
+
+
+def record_path(card):
+    key = hashlib.sha256(card["id"].encode()).hexdigest()
+    return Path(D) / "acceptance" / (key + ".json")
+
+
+def read_record(card):
+    try:
+        return json.loads(record_path(card).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+
+
+def save_record(card, record):
+    path = record_path(card)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as f:
+        staged = Path(f.name)
+        try:
+            json.dump(record, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+            staged.replace(path)
+        finally:
+            staged.unlink(missing_ok=True)
+
+
+def open_acceptance(card, record):
+    requested_at = record.get("requested_at")
+    if record.get("status") not in {"open", "closing"} or not isinstance(requested_at, str):
+        return False
+    lines = [line for line in segments(card)[1].get("accepted", "").splitlines() if line.strip()]
+    return lines[:2] == [HEADING["accepted"], f"申请时间：{requested_at}"]
+
+
+def last_transition(card):
+    rows = pages(card["id"], "history", "actor{id} botActor{id} toStateId")
+    return next((row for row in rows if row["toStateId"] is not None), {})
+
+
+def owner_closed(card):
+    current = card["state"]["name"]
+    if current not in {"Done", "Canceled"}:
+        return False
+    event = last_transition(card)
+    return (event.get("toStateId") == STATES[current] and not event.get("botActor")
+            and (event.get("actor") or {}).get("id") == OWNER["id"])
+
+
+def owner_message(msg_id):
+    """信任消息接收端的独立身份；不能用执行者自己可写的文件当证据。"""
+    try:
+        for path in (OWNER_RECORD, *OWNER_RECORD.parents):
+            st = path.lstat()
+            if path.is_symlink() or st.st_uid != 0 or os.access(path, os.W_OK):
+                raise LinearError("用户原话记录不可验证")
+        with OWNER_RECORD.open(encoding="utf-8") as rows:
+            matches = [row for line in rows
+                       if isinstance(row := json.loads(line), dict) and row.get("id") == msg_id]
+    except (OSError, ValueError):
+        raise LinearError("可信用户原话记录不可用") from None
+    if (not matches or any(not isinstance(row.get("text"), str) or not row["text"].strip()
+                           or not isinstance(row.get("received_at"), str) for row in matches)):
+        raise WriteRejected("在可信记录中找不到这条用户消息")
+    first = min(matches, key=lambda row: timestamp(row["received_at"]))
+    if any((row["text"], row.get("created_at")) != (first["text"], first.get("created_at")) for row in matches):
+        raise WriteRejected("可信记录中同一消息编号对应多条不同原文")
+    return first
+
+
+def approval_text(card, requested_at):
+    return f"同意验收 {card['identifier']} {requested_at}"
+
+
+def acceptance_approval(card, record, msg_id):
+    if not msg_id or not open_acceptance(card, record):
+        raise WriteRejected("这张长期卡没有可核验的验收申请或用户消息编号")
+    approval = owner_message(msg_id)
+    requested_at = record["requested_at"]
+    requested = timestamp(requested_at)
+    try:
+        created = timestamp(approval["created_at"])
+        received = timestamp(approval["received_at"])
+    except (KeyError, TypeError, ValueError, LinearError):
+        raise WriteRejected("可信用户消息缺少有效的创建或接收时间") from None
+    if not requested < created <= received <= datetime.now(timezone.utc):
+        raise WriteRejected("用户回复必须晚于验收申请，且创建和接收时间须有效")
+    if approval["text"].strip() != approval_text(card, requested_at):
+        raise WriteRejected("用户原话未明确同意本卡本次验收。请回复：" + approval_text(card, requested_at))
+    return approval
+
+
+def ask(a, card, record):
+    body = a.body.strip()
+    if not body:
+        raise LinearError("请用首句说清需要童成卓做什么")
+    current = card["state"]["name"]
+    if a.accept:
+        # Compatibility for callers that explicitly track acceptance (e.g. AutoResearch).
+        # Publish evidence on the card without treating ordinary review as a human blocker.
+        if current == "Done":
+            return
+        if current == "Canceled":
+            raise WriteRejected("已取消的卡须重开后再记录验收材料")
+        if open_acceptance(card, record) and record.get("evidence") == a.body:
+            return
+        requested_at = stamp()
+        prefix, blocks = segments(card)
+        evidence = humanize(human_result(body))
+        reply = approval_text(card, requested_at)
+        blocks["accepted"] = (f'{HEADING["accepted"]}\n申请时间：{requested_at}\n\n{evidence}'
+                              f'\n\n需明确验收答复时，回复：`{reply}`')
+        write_description(card, prefix, blocks)
+        save_record(card, {"status": "open", "requested_at": requested_at, "evidence": a.body})
+        return
+    if a.blocking and current in {"Done", "Canceled", "常驻"}:
+        raise WriteRejected("请在仍需推进的卡上标记人工阻塞")
+    notice = humanize(body).rstrip()
+    if OWNER["url"] not in notice:
+        notice += "\n\n" + OWNER["url"]
+    if a.blocking and current != "Human Intervention":
+        checked(update(card["id"], stateId=STATES["Human Intervention"]), "issueUpdate")
+    comment_once(card["id"], notice)
+
+
+def set_state(a, card, record):
+    current = card["state"]["name"]
+    if a.owner_msg and (a.state != "Done" or not is_long(card)):
+        raise WriteRejected("--owner-msg 仅用于长期卡的 Done")
+    if current in {"Done", "Canceled"} and owner_closed(card):
+        if current == a.state:
+            return
+        raise WriteRejected("这张卡由童成卓亲手关闭，请由他重开后再继续")
+    if a.state == "Human Intervention":
+        raise WriteRejected("确实需要人工解除阻塞时请用 ask --blocking")
+    changes = {"stateId": STATES[a.state]}
+    if (card.get("assignee") or {}).get("id") == OWNER["id"]:
+        changes["assigneeId"] = None
+    if a.state in {"Done", "Canceled"} and current != a.state:
+        active = [child["identifier"] for child in pages(card["id"], "children", "identifier archivedAt state{type}")
+                  if not child.get("archivedAt") and child["state"]["type"] not in {"completed", "canceled"}]
+        if active:
+            raise WriteRejected("请先核实未关闭的子卡，以免 Linear 自动关卡：" + "、".join(active))
+    if a.state == "Done":
+        approval = None
+        if a.owner_msg:
+            if current == "Done" and record.get("status") == "closed" and record.get("owner_msg") == a.owner_msg:
+                return
+            approval = acceptance_approval(card, record, a.owner_msg)
+        full = text_file(a.file)
+        if full.lstrip().startswith(CANCEL_REASON):
+            raise WriteRejected("不做了或并入别卡请用 Canceled，并写原因")
+        write_result(card, a.file, full, approval)
+        checked(update(card["id"], **changes), "issueUpdate")
+        if record:
+            save_record(card, {**record, "status": "closed", "owner_msg": a.owner_msg})
+        return
+    if a.state == "Canceled":
+        if not a.file:
+            raise LinearError("请提供取消原因")
+        source = Path(a.file).expanduser()
+        reason = text_file(a.file).strip() if source.is_file() or source.is_absolute() else a.file.strip()
+        if not reason:
+            raise LinearError("请提供取消原因")
+        old = re.sub(r"\A取消原因：[^\n]*\n*", "", card.get("description") or "")
+        changes["description"] = f"取消原因：{humanize(reason.splitlines()[0])}\n\n" + old
+    elif current == "Canceled" and a.state == "In Progress":
+        changes["description"] = re.sub(r"\A取消原因：[^\n]*\n*", "", card.get("description") or "")
+    checked(update(card["id"], **changes), "issueUpdate")
+    if "description" in changes:
+        verify(card["id"], changes["description"])
+    if record:
+        save_record(card, {**record, "status": "withdrawn"})
+
+
+def audit(card):
+    """兼容旧巡检调用。长期卡也可以正常完成、暂停或取消。"""
+    print(card["identifier"], card["state"]["name"])
+
+
+BRANCH_GROUP = "支线"
+BRANCH_LABELS = ("模型侧", "硬件侧")
+
+def add_board_commands(sub):
+    edit = sub.add_parser("edit", help="修改标题、描述、父卡、支线或里程碑")
+    edit.add_argument("ident")
+    edit.add_argument("--title")
+    edit.add_argument("--description-file")
+    hierarchy = edit.add_mutually_exclusive_group()
+    hierarchy.add_argument("--parent", help="挂到指定卡，不折叠层级")
+    hierarchy.add_argument("--top", action="store_true")
+    edit.add_argument("--branch", choices=BRANCH_LABELS)
+    edit.add_argument("--milestone", help="当前项目中的里程碑名称")
+    sub.add_parser("branch-labels", help="确保团队支线标签组和两个互斥标签存在")
+    plink = sub.add_parser("project-link", help="给项目加资源链接（同 URL 不重复加），可选写项目概述")
+    plink.add_argument("project")
+    plink.add_argument("url")
+    plink.add_argument("label")
+    plink.add_argument("--content-file", help="项目概述（Markdown）文件，覆写项目 content")
+    milestone = sub.add_parser("milestone", help="按名称创建或读取项目里程碑")
+    milestone.add_argument("project")
+    milestone.add_argument("names", nargs="+")
+    overview = sub.add_parser("board-edit", help="修改并回读 Initiative、项目或里程碑文案")
+    overview.add_argument("resource", choices=("initiative", "initiativeUpdate", "project", "projectMilestone"))
+    overview.add_argument("ident")
+    overview.add_argument("--name")
+    overview.add_argument("--description")
+    overview.add_argument("--content-file")
+    audit = sub.add_parser("board-audit", help="分页检查 Initiative、项目及里程碑的文案")
+    audit.add_argument("--include-archived", action="store_true")
+    view = sub.add_parser("view", help="按名称创建或更新团队共享视图")
+    view.add_argument("name")
+    view.add_argument("--project")
+    view.add_argument("--state", choices=STATES)
+    view.add_argument("--display-file", help="共享显示选项 JSON 文件")
+    sub.add_parser("sub-issue-automation", help="团队开启子项自动关闭并关闭父项自动关闭")
+
+
+def save_board_resource(resource, fields, data, ident=None, *, personal=False):
+    operation = "Update" if ident else "Create"
+    key = resource + operation
+    input_type = resource[0].upper() + resource[1:] + operation + "Input"
+    id_var, id_arg = (",$id:String!", "id:$id,") if ident else ("", "")
+    query = f"mutation($input:{input_type}!{id_var}){{{key}({id_arg}input:$input){{success {fields}}}}}"
+    variables = {"input": data}
+    if ident:
+        variables["id"] = ident
+    payload = gql(query, variables, personal=True) if personal else gql(query, variables)
+    return checked(payload, key)
+
+
+def branch_labels(create=False):
+    fields = "id name isGroup groupType parent{id} team{id}"
+    query = ("query($names:[String!]!,$after:String){issueLabels(first:50,after:$after,"
+             "filter:{name:{in:$names}}){nodes{" + fields + "} pageInfo{hasNextPage endCursor}}}")
+    nodes = []
+    after = None
+    while True:
+        page = gql(query, {"names": [BRANCH_GROUP, *BRANCH_LABELS], "after": after})["issueLabels"]
+        nodes.extend(page["nodes"])
+        if not page["pageInfo"]["hasNextPage"]:
+            break
+        after = page["pageInfo"]["endCursor"]
+    groups = [row for row in nodes if row["name"] == BRANCH_GROUP and row["isGroup"]]
+    group = next((row for row in groups if (row.get("team") or {}).get("id") == TEAM), None)
+    if not group:
+        group = next((row for row in groups if row.get("team") is None), None)
+    if create and not group:
+        group = save_board_resource("issueLabel", f"issueLabel{{{fields}}}",
+                                    {"teamId": TEAM, "name": BRANCH_GROUP, "isGroup": True,
+                                     "groupType": "singleSelect"})["issueLabel"]
+    if not group:
+        raise LinearError("团队及工作区均不存在支线标签组，请先运行 branch-labels")
+    if group.get("groupType") not in {None, "singleSelect"}:
+        raise LinearError("支线标签组必须是单选")
+    children = {row["name"]: row for row in nodes
+                if (row.get("parent") or {}).get("id") == group["id"]}
+    if create:
+        for name in BRANCH_LABELS:
+            if name not in children:
+                children[name] = save_board_resource(
+                    "issueLabel", f"issueLabel{{{fields}}}",
+                    {**({"teamId": group["team"]["id"]} if group.get("team") else {}),
+                     "name": name, "parentId": group["id"]})["issueLabel"]
+    if set(children) != set(BRANCH_LABELS):
+        raise LinearError("支线标签不完整")
+    return group, children
+
+
+def project_milestones(project):
+    result = gql("query($p:String!){project(id:$p){projectMilestones(first:100){nodes{id name} pageInfo{hasNextPage}}}}",
+                 {"p": project})["project"]["projectMilestones"]
+    if result["pageInfo"]["hasNextPage"]:
+        raise LinearError("项目里程碑超过当前读取范围")
+    return {row["name"]: row for row in result["nodes"]}
+
+
+def edit_card(a, card):
+    changes = {}
+    if a.title is not None:
+        if not a.title.strip():
+            raise LinearError("标题不能为空")
+        changes["title"] = a.title.strip()
+    if a.description_file is not None:
+        body = humanize(text_file(a.description_file), jobs=False)
+        if len(body.encode()) > DESCRIPTION_BYTES:
+            raise LinearError("卡面超过安全长度")
+        changes["description"] = body
+    if a.top:
+        changes["parentId"] = None
+    if a.parent:
+        parent = writable_issue(a.parent)
+        if parent["id"] == card["id"]:
+            raise LinearError("不能把卡挂到自己下面")
+        changes["parentId"] = parent["id"]
+    if a.branch:
+        group, choices = branch_labels()
+        target = choices[a.branch]["id"]
+        removed = [label["id"] for label in pages(card["id"], "labels", "id parent{id}")
+                   if (label.get("parent") or {}).get("id") == group["id"] and label["id"] != target]
+        changes["addedLabelIds"] = [target]
+        if removed:
+            changes["removedLabelIds"] = removed
+    if a.milestone:
+        project = card.get("project")
+        if not project:
+            raise LinearError("挂里程碑前需要项目")
+        milestone = project_milestones(project["id"]).get(a.milestone)
+        if not milestone:
+            raise LinearError(f"项目里程碑不存在：{a.milestone}")
+        changes["projectMilestoneId"] = milestone["id"]
+    if not changes:
+        raise LinearError("请选择需要修改的字段")
+    checked(update(card["id"], **changes), "issueUpdate")
+    if "description" in changes:
+        verify(card["id"], changes["description"])
+    print(card["identifier"])
+
+
+def save_team_view(a):
+    query = ("query($name:String!){customViews(first:30,filter:{name:{eq:$name}})"
+             "{nodes{id name slugId modelName shared team{id} filterData} pageInfo{hasNextPage}}}")
+    page = gql(query, {"name": a.name})["customViews"]
+    if page["pageInfo"]["hasNextPage"] or len(page["nodes"]) > 1:
+        raise LinearError(f"同名视图不唯一：{a.name}")
+    existing = next(iter(page["nodes"]), None)
+    if existing and existing["modelName"] != "Issue":
+        raise LinearError(f"同名视图的类型不是 Issue：{a.name}")
+    filters = {}
+    if a.project:
+        filters["project"] = {"id": {"eq": project_id(a.project)}}
+    if a.state:
+        filters["state"] = {"id": {"eq": STATES[a.state]}}
+    data = {"name": a.name, "teamId": TEAM, "shared": True, "filterData": filters}
+    if existing and existing["shared"] and (existing.get("team") or {}).get("id") == TEAM and existing["filterData"] == filters:
+        view = existing
+    else:
+        view = save_board_resource("customView", "customView{id name slugId}", data,
+                                   (existing or {}).get("id"))["customView"]
+    # Keep the view identifier available even if the display settings are rejected.
+    print(json.dumps(view, ensure_ascii=False), flush=True)
+    if a.display_file:
+        preferences = json.loads(text_file(a.display_file))
+        if not isinstance(preferences, dict):
+            raise LinearError("显示选项需要 JSON 对象")
+        save_board_resource("viewPreferences", "viewPreferences{id}", {
+            "customViewId": view["id"], "viewType": "customView", "type": "organization",
+            "preferences": preferences,
+        })
+
+
+def write_board_command(a):
+    if a.cmd == "branch-labels":
+        group, labels = branch_labels(create=True)
+        print(json.dumps({"group": group, "labels": labels}, ensure_ascii=False))
+    elif a.cmd == "milestone":
+        project = project_id(a.project)
+        existing = project_milestones(project)
+        for name in dict.fromkeys(a.names):
+            row = existing.get(name) or save_board_resource(
+                "projectMilestone", "projectMilestone{id name}",
+                {"projectId": project, "name": name})["projectMilestone"]
+            print(json.dumps(row, ensure_ascii=False), flush=True)
+    elif a.cmd == "view":
+        save_team_view(a)
+    elif a.cmd == "project-link":
+        content = text_file(a.content_file) if a.content_file else None
+        validate_board_text({"content": content})
+        url = urllib.parse.urlsplit(a.url)
+        if url.scheme not in {"https", "http"} or not url.hostname or any(c.isspace() for c in a.url):
+            raise WriteRejected("项目链接用法：project-link 项目 URL 标签。URL 需为 HTTP(S) 地址。")
+        project = project_id(a.project)
+        fields = "id content externalLinks(first:100){nodes{id label url}}"
+        current = gql("query($p:String!){project(id:$p){" + fields + "}}", {"p": project})["project"]
+        row = next((n for n in current["externalLinks"]["nodes"] if n["url"] == a.url), None)
+        if row and row["label"] != a.label:
+            row = save_board_resource("entityExternalLink", "entityExternalLink{id label url}",
+                                      {"label": a.label}, row["id"])["entityExternalLink"]
+        elif not row:
+            row = save_board_resource("entityExternalLink", "entityExternalLink{id label url}",
+                                      {"projectId": project, "url": a.url, "label": a.label})["entityExternalLink"]
+        if a.content_file:
+            save_board_resource("project", "project{id}", {"content": content}, project)
+        expected_html = rendered_description(content) if a.content_file else None
+        for delay in READBACK_DELAYS:
+            if delay:
+                time.sleep(delay)
+            after = gql("query($p:String!){project(id:$p){" + fields + "}}", {"p": project})["project"]
+            link_matches = any(n["url"] == a.url and n["label"] == a.label
+                               for n in after["externalLinks"]["nodes"])
+            actual = after.get("content")
+            content_matches = expected_html is None or markdown_matches(content, actual, expected_html)
+            if link_matches and content_matches:
+                break
+        else:
+            if not link_matches:
+                raise LinearError("回读没找到标签和地址匹配的项目资源链接")
+            raise LinearError("回读项目概述与写入不一致")
+        print(json.dumps({"link": row, "links": after["externalLinks"]["nodes"],
+                          "content_chars": len(after.get("content") or "")}, ensure_ascii=False))
+    else:
+        result = save_board_resource(
+            "team", "team{key autoCloseChildIssues autoCloseParentIssues}",
+            {"autoCloseChildIssues": True, "autoCloseParentIssues": False}, TEAM)
+        print(json.dumps(result["team"], ensure_ascii=False))
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(prog="linear-app")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    add_board_commands(sub)
+    sub.add_parser("whoami")
+    sub.add_parser("waiting")
+    raw = sub.add_parser("gql")
+    raw.add_argument("query")
+    raw.add_argument("variables", nargs="?", default="{}")
+    new = sub.add_parser("new")
+    new.add_argument("title")
+    new.add_argument("brief", nargs="?", default="")
+    new.add_argument("--parent")
+    new.add_argument("--project")
+    new.add_argument("--goal")
+    new.add_argument("--long", action="store_true")
+    new.add_argument("--brief-file")
+    words = new.add_mutually_exclusive_group()
+    words.add_argument("--user-words")
+    words.add_argument("--user-words-file")
+    new.add_argument("--received-at")
+    new.add_argument("--issue-id", help=argparse.SUPPRESS)
+    attach = sub.add_parser("attach", help="把 <REDACTED_HOST_B> 上的视频、图片、表格上传进卡的“直接看”段")
+    attach.add_argument("ident")
+    attach.add_argument("paths", nargs="+")
+    for cmd in ("comment-edit", "comment-delete"):
+        task = sub.add_parser(cmd, help="编辑 Ambition 的评论" if cmd == "comment-edit" else "备份并删除 Ambition 的评论")
+        task.add_argument("ident")
+        task.add_argument("comment_id")
+        if cmd == "comment-edit":
+            task.add_argument("file")
+    for cmd in ("comment", "ask", "parent", "progress", "state", "audit", "long"):
+        task = sub.add_parser(cmd)
+        task.add_argument("ident")
+        if cmd in ("comment", "ask"):
+            task.add_argument("body")
+        if cmd == "comment":
+            task.add_argument("--once", action="store_true")
+        if cmd == "ask":
+            mode = task.add_mutually_exclusive_group()
+            mode.add_argument("--accept", action="store_true", help="将验收材料写入卡面，不发提醒")
+            mode.add_argument("--blocking", action="store_true", help="缺少本人独有的操作或授权，其他人无法继续")
+        if cmd == "long":
+            task.add_argument("--project")
+        if cmd == "parent":
+            task.add_argument("parent")
+        if cmd == "progress":
+            task.add_argument("file")
+            mode = task.add_mutually_exclusive_group()
+            mode.add_argument("--stale", action="store_true")
+            mode.add_argument("--paused", action="store_true", help="本轮已停工，有待续派或核实")
+            task.add_argument("--if-older-than")
+        if cmd == "state":
+            task.add_argument("state", choices=STATES)
+            task.add_argument("file", nargs="?")
+            task.add_argument("--owner-msg")
+    a = parser.parse_args(argv)
+    if a.cmd == "board-audit":
+        return board_audit(a.include_archived)
+    if a.cmd == "board-edit":
+        board_edit(a)
+        return
+    if a.cmd in {"whoami", "waiting", "gql"}:
+        return read_command(a)
+    directory = Path(D)
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        if a.cmd == "attach":
+            for path in media_files(a.paths):  # 大文件在锁外先传，写卡时命中缓存
+                upload(path)
+        with (directory / "writes.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            write_command(a)
+    except WriteRejected as exc:
+        if a.cmd in ("comment-edit", "comment-delete"):
+            report_error(a.cmd, a.ident, exc)
+        raise
+    except (LinearError, OSError, ValueError) as exc:
+        report_error(a.cmd, getattr(a, "ident", None), exc)
+        raise
+
+
+def write_command(a):
+    if a.cmd == "new":
+        create_card(a)
+        return
+    if a.cmd in {"branch-labels", "milestone", "view", "project-link", "sub-issue-automation"}:
+        write_board_command(a)
+        return
+    card = writable_issue(a.ident)
+    if a.cmd in ("comment-edit", "comment-delete"):
+        change_comment(a, card)
+        return
+    if a.cmd == "edit":
+        edit_card(a, card)
+        return
+    if a.cmd == "attach":
+        files = media_files(a.paths)
+        if not files:
+            raise LinearError("没有可上传的文件（支持 " + " ".join(sorted(MEDIA_KIND)) + "，单个不超过 200MB）")
+        print(" ".join(attach_media(card, files)) or "已在卡上")
+        return
+    if a.cmd == "comment":
+        if a.once:
+            comment_once(card["id"], a.body)
+        else:
+            print(json.dumps(checked(comment(card["id"], humanize(a.body)), "commentCreate"), ensure_ascii=False))
+    elif a.cmd == "parent":
+        p = gql("query($i:String!){issue(id:$i){id parent{id}}}", {"i": a.parent})["issue"]
+        print(json.dumps(checked(update(a.ident, parentId=(p.get("parent") or p)["id"]), "issueUpdate"), ensure_ascii=False))
+    elif a.cmd == "progress":
+        print(apply_progress(a.ident, a.file, a.stale, a.if_older_than, card=card, paused=a.paused))
+    else:
+        record = read_record(card) if is_long(card) else {}
+        if a.cmd == "ask":
+            ask(a, card, record)
+            print(a.ident)
+        elif a.cmd == "long":
+            mark_long(a, card)
+        elif a.cmd == "state":
+            set_state(a, card, record)
+            print(a.ident)
+        else:
+            audit(card)
+
+
+def read_command(a):
+    cmd = a.cmd
+    if cmd == "whoami":
+        print(json.dumps(gql("{viewer{id name}}"), ensure_ascii=False))
+    elif cmd == "gql":
+        read_only(a.query)
+        print(json.dumps(gql(a.query, json.loads(a.variables)), ensure_ascii=False, indent=1))
+    elif cmd == "waiting":
+        d = gql('{issues(filter:{team:{key:{eq:"TCZ"}},state:{name:{eq:"Human Intervention"}}}){nodes{identifier title url description comments{nodes{body createdAt user{id name} botActor{name}}}}}}')
+        for i in d["issues"]["nodes"]:
+            print(f"== {i['identifier']} {i['title']}\n   {i['url']}")
+            for line in (i["description"] or "").splitlines():
+                if line.lstrip().startswith(("- [ ]", "* [ ]", "- [x]", "* [x]", "- [X]", "* [X]")):
+                    print("   " + line.strip())
+            cs = sorted(i["comments"]["nodes"], key=lambda c: c["createdAt"])
+            for c in cs[-3:]:
+                who = (c.get("botActor") or {}).get("name") or (c.get("user") or {}).get("name") or "?"
+                print(f"   [{c['createdAt'][:16]} {who}] {c['body'][:300]}")
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except WriteRejected as exc:
+        print(f"Linear 拒绝写入：{exc}", file=sys.stderr)
+        sys.exit(exc.exit_code)
+    except (LinearError, OSError, ValueError) as exc:
+        sys.exit(str(exc))

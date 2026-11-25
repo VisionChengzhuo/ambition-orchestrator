@@ -13,3 +13,16 @@ __pycache__/
 /.tick.lock
 *.bak*
 /.test-home-*/
+
+/amb/jobs/
+/amb/artifacts/
+/amb/.releases/
+/amb/.secrets/
+/amb/config.json.*
+/amb/heartbeat
+/amb/stats.jsonl
+/amb/.lock
+/amb/.tick.lock
+/amb/.test-home-*/
+/amb/amb-work/
+/amb/amb-direct/

@@ -1,0 +1,521 @@
+#!/usr/bin/env python3
+"""Launch direct tasks in isolated directories and relay follow-up instructions."""
+import argparse
+import fcntl
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+# The installed copy in ~/bin shares the orchestrator's ledger and outbox.
+MODULE_DIR = Path(__file__).resolve().parent
+if not (MODULE_DIR / "amb_metrics.py").is_file():
+    MODULE_DIR = Path.home() / "amb"
+    sys.path.insert(0, str(MODULE_DIR))
+from amb import (StepError, card_next_items, clip_card_text, last_json, lead_card, open_item_text,
+                 validate_card_fields,
+                 validate_card_progress, validate_card_result, validate_open_items)
+import amb_events
+import amb_metrics
+import amb_speed
+from card_text import split_summary_message
+
+POLL_SECONDS = 5
+NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}\Z")
+CODEX_OPTIONS = ["--json", "--skip-git-repo-check"]
+INBOX_INSTRUCTIONS = """追加指令会写入本任务目录的 inbox（每行一个 JSON 对象，含 message 字段，序号从 1 开始）。
+执行中可在自然检查点和提交最终答复前读取 inbox，处理尚未确认的消息。
+处理完连续的消息后，把最后一条已处理的序号写入 inbox.ack（例如先写 .inbox.ack.tmp，再用 mv 原子替换）。
+收到接续提示时，按提示继续本会话。若某条已处理，请略过。"""
+
+
+def stamp():
+    return amb_metrics.utc_now()
+
+
+def atomic_write(path, value):
+    temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp.write_text(value, encoding="utf-8")
+        temp.replace(path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+@contextmanager
+def inbox_lock(directory):
+    with (directory / ".inbox.lock").open("a") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        yield
+
+
+def update_status(directory, status, phase, **details):
+    status.update(phase=phase, updated_at=stamp(), **details)
+    atomic_write(directory / "status.json", json.dumps(status, ensure_ascii=False) + "\n")
+
+
+def record_timing(status, event):
+    amb_metrics.append(amb_root(), {
+        "ts": stamp(), "event": event, "source": "direct", "id": status["name"],
+        "state": status["phase"], "speed_hint": status["speed_hint"],
+        **{key: status.get(key) for key in amb_metrics.TIMES},
+    })
+
+
+def amb_root():
+    root = Path(os.environ.get("AMB_ROOT") or "~/amb").expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def finish(directory, status, code, phase=None, *, last_message="", **details):
+    phase = phase or ("done" if code == 0 else "failed")
+    result_path = directory / "out.md"
+    summary_path = result_path
+    prose, final = split_summary_message(last_message)
+    if final is not None:
+        atomic_write(directory / "final.json", json.dumps(final, ensure_ascii=False) + "\n")
+    if final is not None and not prose:
+        reported = final.get("summary")
+        prose = reported.strip() if isinstance(reported, str) else ""
+    if prose:
+        if result_path.exists() and result_path.stat().st_size:
+            summary_path = directory / "summary.md"
+        atomic_write(summary_path, prose)
+    update_status(directory, status, phase, exit_code=code, finished_at=stamp(), **details)
+    if not result_path.is_file():
+        result_path = summary_path = directory / "result.md"
+        atomic_write(result_path, details.get("error") or f"任务 {phase}（退出码 {code}）\n")
+    atomic_write(directory / "exit", f"{code}\n")
+    record_timing(status, phase)
+    sync_terminal_card(directory, status, last_message)
+    with summary_path.open(encoding="utf-8", errors="replace") as result:
+        summary = result.read(8192).strip() or f"任务 {phase}（退出码 {code}）"
+    root = amb_root()
+    amb_events.emit(root, status["name"], status["title"], phase, summary, result_path)
+    cli = MODULE_DIR / "amb.py"
+    if (root / "config.json").is_file() and cli.is_file():
+        try:
+            subprocess.Popen([sys.executable, str(cli), "_job-events"], start_new_session=True,
+                             env={**os.environ, "AMB_ROOT": str(root)},
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            pass  # The regular orchestrator tick also drains the outbox.
+
+
+def exit_code(path):
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    return int(value) if value else None
+
+
+def pending_messages(directory, consumed):
+    with (directory / "inbox").open(encoding="utf-8") as stream:
+        messages = list(stream)
+    try:
+        acknowledged = exit_code(directory / "inbox.ack")
+    except ValueError:
+        acknowledged = None
+    if acknowledged is not None and consumed < acknowledged <= len(messages):
+        consumed = acknowledged
+    return "\n".join(f"{number}. {json.loads(entry)['message']}"
+                     for number, entry in enumerate(messages[consumed:], consumed + 1)), len(messages)
+
+
+def agent_turn(args, directory, prompt, session, first, message_path):
+    if args.agent == "claude":
+        argv = ["claude", "-p", "--session-id" if first else "--resume", session,
+                "--permission-prompts", "none", "--permission-mode", "bypassPermissions"]
+        if args.effort:
+            argv.extend(["--effort", args.effort])
+        output = message_path
+    else:
+        argv = ["codex", "exec"] if first else ["codex", "exec", "resume"]
+        argv.extend([*CODEX_OPTIONS, "--dangerously-bypass-approvals-and-sandbox",
+                     "-o", str(message_path)])
+        if args.effort:
+            argv.extend(["-c", f"model_reasoning_effort={json.dumps(args.effort)}"])
+        output = directory / "log.txt"
+    if args.model:
+        argv.extend(["--model", args.model])
+    if args.agent == "codex":
+        if not first:
+            argv.append(session)
+        argv.append("-")
+    with output.open("a", encoding="utf-8") as stdout, (directory / "err.log").open("a") as stderr:
+        start = stdout.tell()
+        process = subprocess.run(argv, cwd=directory, input=prompt, text=True, encoding="utf-8",
+                                 stdout=stdout, stderr=stderr, check=False)
+    code = process.returncode
+    if args.agent == "codex" and first and code == 0:
+        with output.open("rb") as stream:
+            stream.seek(start)
+            for line in stream:
+                try:
+                    event = json.loads(line)
+                except (ValueError, UnicodeError):
+                    continue
+                if isinstance(event, dict) and event.get("type") == "thread.started":
+                    session = str(uuid.UUID(event["thread_id"]))
+                    break
+        if not session:
+            raise ValueError("Codex 未报告本次运行的会话 ID")
+    return code if code >= 0 else 128 - code, session
+
+
+MEDIA_HINT = '关键产物上卡：视频、图片、表格（csv/tsv）、PDF 放在 <REDACTED_HOST_B> 上，在 summary 里写出绝对路径（文件或所在目录）；产物在别的机器上，先拷到 <REDACTED_HOST_B> 再写路径。写了路径的文件会自动上传进 Linear 卡的“直接看”段：图片和表格直接显示，视频能直接播放，超过 10MB 的自动压成预览。只写结论不写路径，用户在卡上就看不到这些产物。'
+
+
+def linear_app(*argv):
+    """直通任务也在 Linear 事件看板自动建卡、完成设 Done；测试（设了 AMB_DIRECT_ROOT）和失败都不挡任务。"""
+    cmd = Path.home() / "bin" / "linear-app"
+    if "AMB_DIRECT_ROOT" in os.environ or not cmd.is_file():
+        return None
+    try:
+        p = subprocess.run([str(cmd), *argv], capture_output=True, text=True, timeout=60)
+        return p.stdout.strip() if p.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def sync_card(directory, status, last_message):
+    card = status.get("linear")
+    if not card:
+        return
+    report = directory / "linear_result.md"
+    phase = status["phase"]
+    if phase == "cancelled":
+        reason = status.get("error") or "任务已取消"
+        atomic_write(report, clip_card_text(reason, 400) + "\n")
+        out = linear_app("state", card, "Canceled", str(report))
+    elif phase in {"blocked", "failed"}:
+        reason = status.get("error") or f"退出码 {status['exit_code']}"
+        label = "本轮已停工" if phase == "blocked" else "本轮执行失败"
+        atomic_write(report, f"## 现在到哪了\n{label}：{clip_card_text(reason, 400)}"
+                     "\n\n## 下一步\n由 Ambition 核实后续安排。\n")
+        out = linear_app("progress", card, str(report), "--paused")
+    else:
+        final = directory / "final.json"
+        prose, _ = split_summary_message(last_message)
+        source = final.read_text(encoding="utf-8") if final.is_file() else last_message
+        result = last_json(source, "summary", "open_items", tail=None) or {}
+        try:
+            pending = validate_open_items(result)
+        except StepError:
+            pending = None
+        reported_summary = result.get("summary")
+        summary = reported_summary.strip() if isinstance(reported_summary, str) else ""
+        goal_met = result.get("goal_met") is True
+        closes = pending == [] and goal_met and bool(summary)
+        summary = summary or prose or "本轮执行已结束。"
+        # 卡面字数超长只截断，不判失败（<REDACTED_ID>）。
+        summary = clip_card_text(summary, 600 if closes else 400)
+        if closes:
+            deliverable = directory / "out.md"
+            body = deliverable.read_text(encoding="utf-8") if deliverable.is_file() else ""
+            atomic_write(report, summary + ("\n\n" + body if body.strip() != summary else ""))
+            out = linear_app("state", card, "Done", str(report))
+        else:
+            steps = [open_item_text(item) for item in pending or []]
+            if not goal_met:
+                steps.append("目标还没达成" + (f"：{result['goal_gap']}" if result.get("goal_gap") else "（执行者没有报告目标已达成）")
+                             + "，由 Ambition 核实并安排后续。")
+            if pending is None:
+                steps.append("需要核实是否还有未收尾事项。")
+            if not steps:
+                steps.append("由 Ambition 核实并补交结论。")
+            atomic_write(report, f"## 现在到哪了\n{summary}\n\n## 下一步\n" +
+                         "\n".join("- " + step for step in card_next_items(steps)) + "\n")
+            out = linear_app("progress", card, str(report), *(["--paused"] if not pending else []))
+    return out is not None
+
+
+def sync_terminal_card(directory, status, last_message=""):
+    if not status.get("linear"):
+        return True
+    for delay in (0, 1, 3):
+        if delay:
+            time.sleep(delay)
+        try:
+            synced = sync_card(directory, status, last_message)
+        except (OSError, ValueError):
+            synced = False
+        if synced:
+            status.pop("linear_report_error", None)
+            update_status(directory, status, status["phase"], linear_synced_at=stamp())
+            return True
+    print(f"Linear：{status['linear']} 同步失败，可用 amb-direct-run sync {status['name']} 重试",
+          file=sys.stderr, flush=True)
+    update_status(directory, status, status["phase"], linear_report_error="Linear 同步失败")
+    return False
+
+
+def retry_sync(args, base):
+    directory = base / args.name
+    with inbox_lock(directory):
+        status = json.loads((directory / "status.json").read_text(encoding="utf-8"))
+        if status["phase"] not in {"done", "failed", "blocked", "cancelled"} or not status.get("linear"):
+            raise ValueError("只有已结束且有 Linear 卡的任务可以重试同步")
+        if status.get("linear_synced_at"):
+            return 0
+        summary = next((p for p in (directory / "summary.md", directory / "out.md") if p.is_file()), None)
+        return 0 if sync_terminal_card(directory, status, summary.read_text() if summary else "") else 1
+
+
+def run_task(args, base):
+    if any(value is not None and not value.strip() for value in (args.model, args.effort)):
+        raise ValueError("--model 和 --effort 必须是非空字符串")
+    created = stamp()
+    brief = (sys.stdin.read() if args.prompt == "-" else
+             Path(args.prompt).expanduser().read_text(encoding="utf-8"))
+    if not brief.strip():
+        raise ValueError("任务指令不能为空")
+    if args.name in args.after:
+        raise ValueError("任务不能依赖自身")
+    under = args.under
+    creates_card = "AMB_DIRECT_ROOT" not in os.environ and (bool(under) or lead_card() is None)
+    if creates_card and not (args.long or getattr(args, "once", False) or under):
+        raise ValueError("新建卡须明确给 --long 或 --once")
+    if args.long and not (args.project or under):
+        raise ValueError("--long 须同时给 --project 或 --under")
+    title = (args.title or "").strip()
+    if creates_card and (not title or re.fullmatch(r"[a-z0-9._-]+", title)):
+        raise ValueError("直通任务建卡必须给 --title（16 字内、人能读懂的标题，不能用任务名）")
+    title = title or args.name
+    goal = (args.goal or "").strip()
+    if not goal:
+        found = re.search(r"^##[ \t]*目标[^\n]*\n(.*?)(?=^#{1,2}[ \t]|\Z)", brief, re.M | re.S)
+        goal = found.group(1).strip() if found else ""
+    if creates_card:
+        if not goal:
+            raise ValueError("派单必须写目标（含完成标准）：--goal '<一句话目标。完成标准：…>'，或在指令里写 ## 目标 段")
+        validate_card_fields(title, goal)
+    base.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory = base / args.name
+    directory.mkdir(mode=0o700)
+    status = {
+        "schema_version": 1, "name": args.name, "title": title, "agent": args.agent,
+        "model": args.model, "effort": args.effort,
+        "pid": os.getpid(), "created_at": created, "asked_at": args.asked_at or created,
+        "dispatched_at": stamp(), "dependencies": args.after, "long": args.long, "speed_hint": amb_speed.speed_hint_enabled(),
+    }
+    consumed = 0
+    turn = 0
+    last_message = ""
+    session = str(uuid.uuid4()) if args.agent == "claude" else None
+    try:
+        atomic_write(directory / "prompt.md", brief)
+        (directory / "inbox").touch()
+        (directory / "log.txt").touch()
+        words_file = getattr(args, "user_words_file", None)
+        card = None
+        if creates_card:
+            card = linear_app("new", title, "--brief-file", str(directory / "prompt.md"),
+                              "--received-at", status["asked_at"],
+                              *(["--user-words-file", words_file] if words_file else []),
+                              *(["--parent", under] if under else []),
+                              *(["--project", args.project] if args.project else []),
+                              *(["--goal", goal] if goal else []),
+                              *(["--long"] if args.long else []))
+        if card:
+            status["linear"], status["linear_url"] = card.split()[0], card.split()[-1]
+            print(f"Linear：{card}", file=sys.stderr, flush=True)
+        update_status(directory, status, "waiting", turn=turn)
+        record_timing(status, "timing_dispatched")
+        print(directory, flush=True)
+        waiting = [base / name / "exit" for name in args.after]
+        while waiting:
+            remaining = []
+            for prerequisite in waiting:
+                code = exit_code(prerequisite)
+                if code is None:
+                    remaining.append(prerequisite)
+                elif code != 0:
+                    finish(directory, status, 1, "blocked",
+                           error=f"前置任务 {prerequisite.parent.name} 的退出码为 {code}")
+                    return 1
+            waiting = remaining
+            if waiting:
+                time.sleep(POLL_SECONDS)
+        predecessor_dirs = "\n".join(str(base / name) for name in args.after)
+        parts = [brief]
+        if status["speed_hint"]:
+            parts.append(amb_speed.SPEED_HINT)
+        parts.append(INBOX_INSTRUCTIONS)
+        if card:
+            parts.append('最后一条消息用 JSON：{"summary":"完整结论","open_items":[],"goal_met":true,"goal_gap":""}。'
+                         'goal_met 如实回答任务目标是否已经达成，没达成写 goal_gap 说还差什么。'
+                         '尚在运行或等结果的事项每条写 {"what":"事项及机器和 tmux","eta":"带时区的 ISO 8601 时间","owner":"谁来收"}。'
+                         '全部收尾才填空数组。')
+            parts.append("现在到哪了最多 400 字，可直接关卡的结果最多 600 字。下一步最多 10 条，每条最多 100 字。"
+                         f"进行中用 amb-direct-run progress {args.name} <文件> 报进度，"
+                         "文件写 ## 现在到哪了 和 ## 下一步。")
+            parts.append(MEDIA_HINT)
+        prompt = "\n\n".join(parts)
+        if predecessor_dirs:
+            prompt += "\n\n前置任务已成功完成，产物在以下目录：\n" + predecessor_dirs
+
+        format_retry = False
+        while True:
+            with inbox_lock(directory):
+                messages, delivered = pending_messages(directory, consumed)
+                if turn and not messages:
+                    result = last_json(last_message, "summary", "open_items", tail=None) if card else None
+                    if result is not None:
+                        try:
+                            items = validate_open_items(result)
+                        except (ValueError, StepError) as exc:
+                            error = exc.detail if isinstance(exc, StepError) else str(exc)
+                            if format_retry:
+                                raise ValueError(error) from exc
+                            prompt = f"卡面格式错误：{error}。请只重写最终 JSON，保留已完成的工作和结果全文。"
+                            format_retry = True
+                        else:
+                            finish(directory, status, 0, last_message=last_message)
+                            break
+                    else:
+                        finish(directory, status, 0, last_message=last_message)
+                        break
+                if messages:
+                    if turn:
+                        prompt = "继续处理本任务。以下是尚未确认的追加指令："
+                    prompt += f"\n\n追加指令（序号与 inbox 行号一致）：\n{messages}"
+                turn += 1
+                if turn == 1:
+                    status["started_at"] = stamp()
+                update_status(directory, status, "running", turn=turn, session_id=session)
+                if turn == 1:
+                    record_timing(status, "timing_started")
+            with TemporaryDirectory(prefix=".agent-message-", dir=directory) as temporary:
+                message_path = Path(temporary) / "message"
+                code, session = agent_turn(args, directory, prompt, session, turn == 1, message_path)
+                if message_path.is_file():
+                    message = message_path.read_text(encoding="utf-8", errors="replace")
+                    if message.strip():
+                        last_message = message
+            status["session_id"] = session
+            if code:
+                with inbox_lock(directory):
+                    finish(directory, status, code, last_message=last_message)
+                return code
+            consumed = delivered
+        return 0
+    except (OSError, ValueError, KeyError, TypeError, KeyboardInterrupt, SystemExit) as exc:
+        if (directory / "exit").is_file():
+            raise
+        code = exc.code if isinstance(exc, SystemExit) else 130 if isinstance(exc, KeyboardInterrupt) else 1
+        phase = "cancelled" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else "failed"
+        with inbox_lock(directory):
+            finish(directory, status, code, phase, last_message=last_message,
+                   error=str(exc) or "interrupted")
+        if code == 1:
+            print(f"amb-direct-run: {exc}", file=sys.stderr)
+        return code
+
+
+def send(args, base):
+    if not args.message.strip():
+        raise ValueError("追加指令不能为空")
+    directory = base / args.name
+    if not (directory / "status.json").is_file():
+        raise ValueError(f"找不到任务 {args.name} 的运行记录")
+    with inbox_lock(directory):
+        status = json.loads((directory / "status.json").read_text(encoding="utf-8"))
+        if status.get("schema_version") != 1 or status.get("phase") not in {"waiting", "running"}:
+            raise ValueError(f"任务 {args.name} 已结束或不接受追加指令")
+        message = json.dumps({"at": stamp(), "message": args.message}, ensure_ascii=False)
+        with (directory / "inbox").open("a", encoding="utf-8") as stream:
+            stream.write(message + "\n")
+    return 0
+
+
+def progress(args, base):
+    directory = base / args.name
+    status_path = directory / "status.json"
+    if not status_path.is_file():
+        raise ValueError(f"找不到任务 {args.name} 的运行记录")
+    text = Path(args.file).expanduser().read_text(encoding="utf-8")
+    text = validate_card_progress(text)
+    with inbox_lock(directory):
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        if status.get("phase") not in {"waiting", "running"}:
+            raise ValueError(f"任务 {args.name} 已结束")
+        if not (card := status.get("linear")):
+            raise ValueError("任务没有可写的 Linear 卡")
+        report = directory / "linear_progress.md"
+        atomic_write(report, text)
+        if linear_app("progress", card, str(report)) is None:
+            raise ValueError(f"Linear {card} 进度更新失败")
+        if args.ask and linear_app("ask", card, args.ask) is None:
+            raise ValueError(f"Linear {card} 已写入进度，申请用户决定失败")
+    return 0
+
+
+def task_name(value):
+    if not NAME.fullmatch(value):
+        raise argparse.ArgumentTypeError("任务名须以字母或数字起始，只允许字母、数字、点、下划线和连字符")
+    return value
+
+
+def asked_at(value):
+    try:
+        return amb_metrics.normalize_asked(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    run = subparsers.add_parser("run", help="在新目录和新会话中执行任务")
+    run.add_argument("name", type=task_name)
+    run.add_argument("--prompt", required=True, help="任务指令文件，- 表示标准输入")
+    run.add_argument("--title")
+    run.add_argument("--asked-at", type=asked_at)
+    run.add_argument("--user-words-file", help="卡面的用户原话文件")
+    run.add_argument("--under", help="有独立交付和状态时，显式指定父卡（TCZ-n）")
+    card_type = run.add_mutually_exclusive_group()
+    card_type.add_argument("--long", action="store_true")
+    card_type.add_argument("--once", action="store_true")
+    run.add_argument("--project", help="Linear 项目名")
+    run.add_argument("--goal", help="卡面“目标”一句话含完成标准；必填，也可写在指令的 ## 目标 段")
+    run.add_argument("--after", action="append", default=[], type=task_name, help="前置任务名，可重复")
+    run.add_argument("--agent", choices=["codex", "claude"], default="codex")
+    run.add_argument("--model", help="仅覆盖本单执行模型")
+    run.add_argument("--effort", help="仅覆盖本单推理档位")
+    message = subparsers.add_parser("send", help="向等待中或执行中的任务追加指令")
+    message.add_argument("name", type=task_name)
+    message.add_argument("message")
+    progress_cmd = subparsers.add_parser("progress", help="更新在跑任务的卡面进度")
+    progress_cmd.add_argument("name", type=task_name)
+    progress_cmd.add_argument("file")
+    progress_cmd.add_argument("--ask", help="请童成卓决定的问题")
+    sync = subparsers.add_parser("sync", help="重试已结束任务的 Linear 同步")
+    sync.add_argument("name", type=task_name)
+    args = parser.parse_args()
+    base = Path(os.environ.get("AMB_DIRECT_ROOT", "~/amb-direct")).expanduser().resolve()
+    try:
+        if args.command == "send":
+            return send(args, base)
+        if args.command == "progress":
+            return progress(args, base)
+        if args.command == "sync":
+            return retry_sync(args, base)
+        signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
+        return run_task(args, base)
+    except (OSError, ValueError) as exc:
+        print(f"amb-direct-run: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
